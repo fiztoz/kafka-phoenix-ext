@@ -1,0 +1,101 @@
+# kafka-phoenix-ext Deployment — separate pod, never a Phoenix sidecar.
+# Adjust namespace, image tag, KAFKA_BROKERS and resource values before
+# applying. Expected secrets:
+#   kafka-phoenix-ext    (key sasl-password)
+#   kafka-phoenix-ext-db (key dsn)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-phoenix-ext
+  namespace: phoenix
+  labels:
+    app.kubernetes.io/name: kafka-phoenix-ext
+spec:
+  replicas: 1 # multi-replica hysteresis ownership is a later problem
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka-phoenix-ext
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka-phoenix-ext
+    spec:
+      automountServiceAccountToken: false # no Kubernetes API access needed
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka-phoenix-ext
+          image: ghcr.io/fiztoz/kafka-phoenix-ext:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: KAFKA_BROKERS
+              value: "kafka-0.kafka.svc:9092,kafka-1.kafka.svc:9092,kafka-2.kafka.svc:9092"
+            # none | plain | scram-sha-256 | scram-sha-512
+            - name: KAFKA_SASL_MECHANISM
+              value: "scram-sha-512"
+            - name: KAFKA_SASL_USERNAME
+              value: "kafka-usage"
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-phoenix-ext
+                  key: sasl-password
+            # SASL → dial the brokers over TLS; leave "" for plaintext.
+            - name: KAFKA_TLS_ENABLED
+              value: "true"
+            - name: KAFKA_TLS_CA_FILE
+              value: /etc/kafka-ca/ca.pem
+            - name: KAFKA_POLL_INTERVAL
+              value: "15m"
+            - name: DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-phoenix-ext-db
+                  key: dsn
+            - name: BASE_PATH
+              value: /kafka
+            - name: LISTEN_ADDR
+              value: ":8080"
+          volumeMounts:
+            - name: kafka-ca
+              mountPath: /etc/kafka-ca
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          startupProbe:
+            httpGet:
+              path: /kafka/health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 45 # up to 90s before liveness kicks in
+          livenessProbe:
+            httpGet:
+              path: /kafka/health/live
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /kafka/health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 60
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      volumes:
+        - name: kafka-ca
+          configMap:
+            name: kafka-phoenix-ext-ca

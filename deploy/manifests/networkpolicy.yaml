@@ -1,0 +1,37 @@
+# Optional: required ONLY when the Phoenix chart renders its extension
+# NetworkPolicy (networkPolicy.enabled: true). That template allows egress
+# 80/443/4443/3306 + DNS but not Kafka broker ports; NetworkPolicies are
+# additive, so this union policy opens 9092-9094 for the extension pod
+# without weakening Phoenix's own policy. Match the selectors the chart
+# renders for extensions[].id == "kafka-usage" (release name assumed kafka
+# stack), or run standalone beneath the manifests in this directory.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-phoenix-ext-brokers
+  namespace: phoenix
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafka-phoenix-ext
+  policyTypes:
+    - Egress
+  egress:
+    # Kafka brokers: plaintext (9092), TLS (9093), SASL_SSL (9094).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+        - protocol: TCP
+          port: 9094
+    # Phoenix MariaDB (shared phoenix DB) — kept explicit because the
+    # chart's egress covers 3306 to any namespace already; re-stating it
+    # documents the dependency.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 3306

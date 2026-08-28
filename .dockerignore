@@ -1,0 +1,7 @@
+.git
+.github
+bin
+*.db
+deploy
+README.md
+Dockerfile

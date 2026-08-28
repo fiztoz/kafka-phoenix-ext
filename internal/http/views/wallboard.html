@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Kafka Wallboard</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: #0b0f15; color: #e8edf3;
+  font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+.wrap { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+.top { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+h1 { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
+.big {
+  font-size: 44px; font-weight: 700; letter-spacing: -0.02em; color: #f2a08f;
+  font-variant-numeric: tabular-nums;
+}
+.meta { color: #93a1b0; font-size: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-top: 26px; }
+.tile { background: #161d29; border: 1px solid #26303f; border-radius: 12px; padding: 16px; }
+.tile h2 { font-size: 15px; margin: 0 0 4px; font-weight: 600; word-break: break-all; }
+.tile .size { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile .bar { background: #2b2530; height: 8px; border-radius: 4px; margin-top: 10px; }
+.tile .fill { background: #d75a4a; height: 8px; border-radius: 4px; }
+.tile .dets { margin-top: 10px; color: #93a1b0; font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; }
+.badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; font-weight: 600; }
+.badge.bad { background: rgba(192,57,43,.18); color: #e06c5f; }
+.brokers { margin-top: 22px; color: #93a1b0; font-size: 14px; display: flex; gap: 18px; flex-wrap: wrap; }
+footer { margin-top: 26px; color: #5b6b7c; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="top">
+  <div>
+    <h1>Kafka Storage</h1>
+    <div class="meta">
+      {{if .ClusterID}}cluster {{.ClusterID}} · {{end}}
+      {{len .Brokers}} brokers · polled {{ts .PolledAt}} ({{age .PolledAt}})
+      {{if not .PollOK}} · <span style="color:#e06c5f">poll failed: {{.LastError}}</span>{{end}}
+    </div>
+  </div>
+  <div style="text-align:right">
+    <div class="meta">total on disk</div>
+    <div class="big">{{bytes .TotalBytes}}</div>
+  </div>
+</div>
+
+<div class="grid">
+{{range .Topics}}
+<div class="tile">
+  <h2>{{.Name}}{{if .ConfirmedOver}} <span class="badge bad">over</span>{{end}}{{if .UnderRep}} <span class="badge bad">under-rep</span>{{end}}</h2>
+  <div class="size">{{bytes .StorageBytes}}</div>
+  <div class="bar"><div class="fill" style="width: {{pct .StorageBytes $.TotalBytes}}"></div></div>
+  <div class="dets">
+    <span>{{.Partitions}} partitions</span>
+    <span>RF {{rf .Replicas .Partitions}}</span>
+    <span>growth {{growth .GrowthPerHour}}</span>
+  </div>
+</div>
+{{else}}
+<div class="tile"><h2>No topics yet</h2><div class="meta">Waiting for the first successful poll…</div></div>
+{{end}}
+</div>
+
+<div class="brokers">
+{{range .Brokers}}
+  <span>broker {{.ID}}{{if .Host}} ({{.Host}}){{end}} — {{bytes .Bytes}} · {{.Partitions}} copies</span>
+{{end}}
+</div>
+
+<footer>Storage = all replica copies (DescribeLogDirs). Auto-refresh 60s.</footer>
+</div>
+</body>
+</html>

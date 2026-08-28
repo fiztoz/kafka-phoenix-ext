@@ -1,0 +1,21 @@
+# Ingress path snippet — the /kafka rule MUST be inserted BEFORE the
+# catch-all / rule of the Phoenix Ingress (or applied as its own resource
+# with the more specific path). Same host as Phoenix so the admin iframe
+# stays same-origin (frame-ancestors 'self').
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kafka-phoenix-ext
+  namespace: phoenix
+spec:
+  rules:
+    - host: phoenix.example.com
+      http:
+        paths:
+          - path: /kafka
+            pathType: Prefix
+            backend:
+              service:
+                name: kafka-phoenix-ext
+                port:
+                  number: 8080

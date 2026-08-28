@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kafka Storage</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --text: #1c2430;
+  --muted: #5b6b7c;
+  --line: #e3e8ee;
+  --accent: #d75a4a;
+  --ok: #2e9e5b;
+  --warn: #b7791f;
+  --bad: #c0392b;
+  --bar: #f0e4e2;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #10151d;
+    --card: #181f2a;
+    --text: #e8edf3;
+    --muted: #93a1b0;
+    --line: #28313e;
+    --bar: #33262a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+.wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 48px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: 13px; }
+.pill {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600;
+}
+.pill.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+.pill.bad { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+.banner {
+  margin: 14px 0; padding: 10px 14px; border-radius: 8px;
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  color: var(--bad); font-size: 13px;
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 16px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+.card .v { font-size: 20px; font-weight: 650; margin-top: 2px; }
+.card .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+.brokers { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+.broker {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 12px; font-size: 12px;
+}
+.broker b { font-size: 14px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; background: color-mix(in srgb, var(--card) 70%, var(--bg)); }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+a { color: var(--accent); text-decoration: none; font-weight: 600; }
+a:hover { text-decoration: underline; }
+.bar-outer { background: var(--bar); border-radius: 4px; height: 6px; width: 90px; display: inline-block; vertical-align: middle; margin-right: 6px; }
+.bar-inner { background: var(--accent); border-radius: 4px; height: 6px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; }
+.badge.warn { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
+.badge.bad { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+.badge.stale { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+form.inline { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+form.inline input[type=text], form.inline input[type=number] {
+  width: 96px; padding: 4px 6px; font: 12px/1.4 ui-monospace, monospace;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text);
+}
+button {
+  font: 12px/1.4 -apple-system, sans-serif; padding: 4px 10px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.del:hover { border-color: var(--bad); color: var(--bad); }
+.thr { font-size: 12px; }
+.thr .set { font-variant-numeric: tabular-nums; }
+footer { margin-top: 18px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Kafka Storage</h1>
+  <span class="sub">{{if .ClusterID}}cluster <b>{{.ClusterID}}</b>{{else}}cluster —{{end}}</span>
+  <span class="sub">brokers {{len .Brokers}}</span>
+  <span class="sub">topics {{len .Topics}}</span>
+  <span class="sub">controller {{.ControllerID}}</span>
+  {{if .PollOK}}<span class="pill ok">polling ok</span>{{else}}<span class="pill bad">poll failed</span>{{end}}
+</header>
+
+{{if not .PollOK}}
+<div class="banner">Last poll failed{{if .LastError}}: {{.LastError}}{{end}}. Showing the last good sample.</div>
+{{end}}
+
+<div class="cards">
+  <div class="card"><div class="k">Total on disk</div><div class="v">{{bytes .TotalBytes}}</div></div>
+  <div class="card"><div class="k">Brokers</div><div class="v">{{len .Brokers}}</div></div>
+  <div class="card"><div class="k">Topics</div><div class="v">{{len .Topics}}</div></div>
+  <div class="card"><div class="k">Polled</div><div class="v"><small>{{ts .PolledAt}} ({{age .PolledAt}})</small></div></div>
+</div>
+
+<div class="brokers">
+{{range .Brokers}}
+  <div class="broker"><b>{{bytes .Bytes}}</b> broker {{.ID}}{{if .Host}} · {{.Host}}{{end}} · {{.Partitions}} copies</div>
+{{else}}
+  <div class="broker">no broker data yet</div>
+{{end}}
+</div>
+
+<table>
+<thead>
+<tr>
+  <th>Topic</th>
+  <th class="num">Size</th>
+  <th class="num">Share</th>
+  <th class="num">Data</th>
+  <th class="num">Growth</th>
+  <th class="num">Part./RF</th>
+  <th>Health</th>
+  <th>Threshold</th>
+</tr>
+</thead>
+<tbody>
+{{range .Topics}}
+<tr>
+  <td>
+    <a href="{{$.BasePath}}/topic/{{.Name}}">{{.Name}}</a>
+    {{if .IsInternal}}<span class="badge stale">internal</span>{{end}}
+    {{if .Stale}}<span class="badge stale">stale</span>{{end}}
+  </td>
+  <td class="num">{{bytes .StorageBytes}}</td>
+  <td class="num"><span class="bar-outer"><span class="bar-inner" style="width: {{pct .StorageBytes $.TotalBytes}}"></span></span>{{pct .StorageBytes $.TotalBytes}}</td>
+  <td class="num">{{bytes .LeaderBytes}}</td>
+  <td class="num">{{growth .GrowthPerHour}}</td>
+  <td class="num">{{.Partitions}} / {{rf .Replicas .Partitions}}</td>
+  <td>
+    {{if .UnderRep}}<span class="badge bad">{{.UnderRep}} under-rep</span>{{end}}
+    {{if .Offline}}<span class="badge bad">{{.Offline}} offline</span>{{end}}
+    {{if and (not .UnderRep) (not .Offline)}}<span style="color:var(--ok)">ok</span>{{end}}
+  </td>
+  <td class="thr">
+    {{if .ThresholdBytes}}
+      {{if .ConfirmedOver}}<span class="badge bad">over ({{.OverStreak}}×)</span>
+      {{else if ge .StorageBytes .ThresholdBytes}}<span class="badge bad">over</span>
+      {{else if .WarnBytes}}
+        {{if ge .StorageBytes .WarnBytes}}<span class="badge warn">warn</span>{{else}}<span class="badge" style="color:var(--ok)">under</span>{{end}}
+      {{else}}<span class="badge" style="color:var(--ok)">under</span>{{end}}
+      <span class="set">limit {{bytes .ThresholdBytes}}{{if .WarnBytes}} · warn {{bytes (numv .WarnBytes)}}{{end}}</span>
+    {{else}}
+      —
+    {{end}}
+    <form class="inline" method="post" action="{{$.BasePath}}/thresholds" style="margin-top:4px">
+      <input type="hidden" name="topic" value="{{.Name}}">
+      <input type="number" name="warn_bytes" min="1" placeholder="warn B" value="{{num .WarnBytes}}">
+      <input type="number" name="threshold_bytes" min="1" placeholder="limit B" value="{{num .ThresholdBytes}}" required>
+      <button type="submit">save</button>
+      {{if .ThresholdBytes}}<button class="del" type="submit" formaction="{{$.BasePath}}/thresholds/delete" formmethod="post">✕</button>{{end}}
+    </form>
+  </td>
+</tr>
+{{else}}
+<tr><td colspan="8" style="color:var(--muted)">No topics yet — waiting for the first successful poll.</td></tr>
+{{end}}
+</tbody>
+</table>
+
+{{range .BrokerErrors}}
+<div class="banner" style="margin-top:10px">Partial data: {{.}}</div>
+{{end}}
+
+<footer>
+  Storage = all replica copies as reported by DescribeLogDirs (cluster-wide disk footprint).
+  Data = leader copies only (logical size). Values update every poll.
+  <a href="{{.BasePath}}/wallboard">Wallboard</a>
+</footer>
+</div>
+</body>
+</html>
