@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Topic.Name}} — Kafka Storage</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9; --card: #ffffff; --text: #1c2430; --muted: #5b6b7c; --line: #e3e8ee;
+  --accent: #d75a4a; --ok: #2e9e5b; --warn: #b7791f; --bad: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #10151d; --card: #181f2a; --text: #e8edf3; --muted: #93a1b0; --line: #28313e; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+.wrap { max-width: 1020px; margin: 0 auto; padding: 24px 20px 48px; }
+a { color: var(--accent); text-decoration: none; font-weight: 600; }
+a:hover { text-decoration: underline; }
+h1 { font-size: 20px; margin: 8px 0 2px; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: 13px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 16px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+.card .v { font-size: 19px; font-weight: 650; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; }
+.badge.bad { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+.badge.warn { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
+.badge.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+form.inline { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+form.inline input[type=number] { width: 96px; padding: 4px 6px; font: 12px/1.4 ui-monospace, monospace; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+button { font: 12px/1.4 -apple-system, sans-serif; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.del:hover { border-color: var(--bad); color: var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<a href="{{.BasePath}}/">← all topics</a>
+<h1>{{.Topic.Name}}</h1>
+<span class="sub">
+  cluster {{if .ClusterID}}{{.ClusterID}}{{else}}—{{end}} ·
+  polled {{ts .PolledAt}} ({{age .PolledAt}})
+  {{if .Topic.IsInternal}} · internal{{end}}
+  {{if .Topic.Stale}} · stale{{end}}
+</span>
+
+<div class="cards">
+  <div class="card"><div class="k">Size (all replicas)</div><div class="v">{{bytes .Topic.StorageBytes}}</div></div>
+  <div class="card"><div class="k">Data (leaders)</div><div class="v">{{bytes .Topic.LeaderBytes}}</div></div>
+  <div class="card"><div class="k">Growth</div><div class="v">{{growth .Topic.GrowthPerHour}}</div></div>
+  <div class="card"><div class="k">Partitions / RF</div><div class="v">{{.Topic.Partitions}} / {{rf .Topic.Replicas .Topic.Partitions}}</div></div>
+  <div class="card">
+    <div class="k">Threshold</div>
+    <div class="v" style="font-size:14px">
+      {{if .Topic.ThresholdBytes}}
+        limit {{bytes (numv .Topic.ThresholdBytes)}}{{if .Topic.WarnBytes}} · warn {{bytes (numv .Topic.WarnBytes)}}{{end}}
+        {{if .Topic.ConfirmedOver}}<span class="badge bad">confirmed over</span>{{else}}<span class="badge ok">ok</span>{{end}}
+      {{else}}<span style="color:var(--muted)">none</span>{{end}}
+    </div>
+  </div>
+</div>
+
+<form class="inline" method="post" action="{{$.BasePath}}/thresholds" style="margin-bottom:16px">
+  <input type="hidden" name="topic" value="{{.Topic.Name}}">
+  <input type="number" name="warn_bytes" min="1" placeholder="warn bytes" value="{{num .Topic.WarnBytes}}">
+  <input type="number" name="threshold_bytes" min="1" placeholder="limit bytes" value="{{num .Topic.ThresholdBytes}}" required>
+  <button type="submit">save threshold</button>
+  {{if .Topic.ThresholdBytes}}<button class="del" type="submit" formaction="{{$.BasePath}}/thresholds/delete" formmethod="post">remove threshold</button>{{end}}
+</form>
+
+<table>
+<thead>
+<tr>
+  <th>Partition</th>
+  <th class="num">Leader</th>
+  <th class="num">Size</th>
+  <th class="num">Replicas</th>
+  <th class="num">ISR</th>
+  <th class="num">Lag</th>
+  <th>Flags</th>
+</tr>
+</thead>
+<tbody>
+{{range .Topic.Parts}}
+<tr>
+  <td>{{.Partition}}</td>
+  <td class="num">{{.Leader}}</td>
+  <td class="num">{{bytes .SizeBytes}}</td>
+  <td class="num" style="max-width:180px">{{join .Replicas}}</td>
+  <td class="num" style="max-width:180px">{{join .ISR}}</td>
+  <td class="num">{{.OffsetLag}}</td>
+  <td>
+    {{if .UnderRep}}<span class="badge bad">under-replicated</span>{{end}}
+    {{if .Offline}}<span class="badge bad">offline replica</span>{{end}}
+    {{if and (not .UnderRep) (not .Offline)}}<span class="badge ok">ok</span>{{end}}
+  </td>
+</tr>
+{{else}}
+<tr><td colspan="7" style="color:var(--muted)">No partition detail (metadata unavailable).</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+</body>
+</html>
