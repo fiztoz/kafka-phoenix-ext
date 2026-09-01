@@ -61,7 +61,10 @@ func run() error {
 
 	// Kafka may be down at startup: never crash-loop for that. HTTP comes up,
 	// /health/live is 200 and /health/ready is 503 until a poll succeeds.
-	p := poller.New(ctx, client, st, pollerOptions(cfg), cfg.PollInterval, log)
+	p := poller.New(ctx, client, st, pollerOptions(cfg), poller.SkewPolicy{
+		SharePct: cfg.BrokerSkewPct,
+		MaxBytes: cfg.BrokerMaxBytes,
+	}, cfg.PollInterval, log)
 	go p.Run(ctx)
 
 	srv, err := newHTTPServer(cfg, p, st, log)

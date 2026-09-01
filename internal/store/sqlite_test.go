@@ -86,12 +86,13 @@ func TestSQLiteStateAndThresholdRoundTrip(t *testing.T) {
 		t.Errorf("last_error should reset: %q", byTopic["orders"].LastError)
 	}
 
-	// Thresholds round-trip incl. NULL warn.
+	// Thresholds round-trip incl. NULL warn and growth columns.
 	warn := int64(1024)
-	if err := s.SetThreshold(ctx, "orders", 2048, &warn); err != nil {
+	growth := int64(512)
+	if err := s.SetThreshold(ctx, "orders", 2048, &warn, &growth); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetThreshold(ctx, "events", 4096, nil); err != nil {
+	if err := s.SetThreshold(ctx, "events", 4096, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	th, err := s.Thresholds(ctx)
@@ -101,8 +102,11 @@ func TestSQLiteStateAndThresholdRoundTrip(t *testing.T) {
 	if th["orders"].WarnBytes == nil || *th["orders"].WarnBytes != 1024 {
 		t.Errorf("orders threshold = %+v", th["orders"])
 	}
-	if th["events"].WarnBytes != nil {
-		t.Errorf("events warn should be nil: %+v", th["events"])
+	if th["orders"].GrowthPerHour == nil || *th["orders"].GrowthPerHour != 512 {
+		t.Errorf("orders growth threshold = %+v", th["orders"])
+	}
+	if th["events"].WarnBytes != nil || th["events"].GrowthPerHour != nil {
+		t.Errorf("events optional columns should be nil: %+v", th["events"])
 	}
 	if th["orders"].UpdatedAt.IsZero() {
 		t.Error("updated_at lost")

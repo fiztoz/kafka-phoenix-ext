@@ -1,0 +1,1 @@
+ALTER TABLE ext_kafka_usage_thresholds DROP COLUMN growth_bytes_per_hour;

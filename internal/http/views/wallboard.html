@@ -5,75 +5,132 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="60">
 <title>Kafka Wallboard</title>
+{{template "styles" .}}
 <style>
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body {
-  margin: 0; background: #0b0f15; color: #e8edf3;
-  font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+/* The wallboard is always dark: it lives on TVs and NOC screens, and the
+   dark tokens double as its low-glare mode. Same palette family as the
+   dashboard's dark scheme, locked here regardless of OS preference. */
+:root {
+  color-scheme: dark;
+  --bg:#0b0f15; --panel:#141b26; --inset:#0f151e;
+  --text:#e7ecf2; --muted:#8e9caa; --faint:#5f6b78;
+  --line:#222d3b; --line-strong:#35424f;
+  --accent:#e0715c;
+  --btn-bg:#e0715c; --btn-fg:#1c1210;
+  --ok:#4cc284; --warn:#d29a3a; --bad:#e0604c;
 }
-.wrap { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
-.top { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; }
-h1 { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
-.big {
-  font-size: 44px; font-weight: 700; letter-spacing: -0.02em; color: #f2a08f;
-  font-variant-numeric: tabular-nums;
-}
-.meta { color: #93a1b0; font-size: 14px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-top: 26px; }
-.tile { background: #161d29; border: 1px solid #26303f; border-radius: 12px; padding: 16px; }
-.tile h2 { font-size: 15px; margin: 0 0 4px; font-weight: 600; word-break: break-all; }
-.tile .size { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.tile .bar { background: #2b2530; height: 8px; border-radius: 4px; margin-top: 10px; }
-.tile .fill { background: #d75a4a; height: 8px; border-radius: 4px; }
-.tile .dets { margin-top: 10px; color: #93a1b0; font-size: 12.5px; display: flex; gap: 14px; flex-wrap: wrap; }
-.badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; font-weight: 600; }
-.badge.bad { background: rgba(192,57,43,.18); color: #e06c5f; }
-.brokers { margin-top: 22px; color: #93a1b0; font-size: 14px; display: flex; gap: 18px; flex-wrap: wrap; }
-footer { margin-top: 26px; color: #5b6b7c; font-size: 12.5px; }
+.wallboard .brand h1 { font-size:24px; }
+.wallboard .card .v { font-size:22px; }
+.wallboard .card .v.accent { font-size:clamp(24px, 3vw, 30px); }
 </style>
 </head>
-<body>
+<body class="wallboard">
 <div class="wrap">
-<div class="top">
-  <div>
-    <h1>Kafka Storage</h1>
-    <div class="meta">
-      {{if .ClusterID}}cluster {{.ClusterID}} · {{end}}
-      {{len .Brokers}} brokers · polled {{ts .PolledAt}} ({{age .PolledAt}})
-      {{if not .PollOK}} · <span style="color:#e06c5f">poll failed: {{.LastError}}</span>{{end}}
+<header class="topbar">
+  <div class="brand">
+    <h1>Kafka Storage Wallboard</h1>
+    <div class="sub">
+      {{if .ClusterID}}<span>cluster <b>{{.ClusterID}}</b></span>{{end}}
+      <span>{{len .Brokers}} brokers</span>
+      <span>polled {{age .PolledAt}} ago</span>
+      {{if not .PollOK}}<span class="pill bad">poll failed</span>{{else}}<span class="pill ok">polling ok</span>{{end}}
     </div>
   </div>
-  <div style="text-align:right">
-    <div class="meta">total on disk</div>
-    <div class="big">{{bytes .TotalBytes}}</div>
+  <div class="actions">
+    <div class="search">
+      <label class="sr-only" for="filter">Filter topics</label>
+      <input type="search" id="filter" placeholder="Filter topics (press /)" autocomplete="off" spellcheck="false">
+      <span class="count" id="filter-count" role="status"></span>
+    </div>
+    <a class="btn" href="{{.BasePath}}/">Exit wallboard</a>
   </div>
+</header>
+
+{{if not .PollOK}}
+<div class="banner bad">
+  {{if eq .ErrKind "auth"}}Kafka authenticated, but this principal is missing permissions.
+  {{else if eq .ErrKind "timeout"}}The Kafka poll timed out.
+  {{else}}Kafka is unreachable.{{end}}
+  Showing the last good sample.
+  {{if .LastError}}<span class="hint">Last error: {{.LastError}}</span>{{end}}
+</div>
+{{end}}
+
+<div class="cards">
+  <div class="card"><div class="k">Total on disk</div><div class="v accent">{{bytes .TotalBytes}}</div></div>
+  <div class="card"><div class="k">Topics</div><div class="v">{{len .Topics}}</div></div>
+  <div class="card"><div class="k">Hottest broker</div><div class="v">{{if ge .SkewHotID 0}}#{{.SkewHotID}} {{.SkewShare}}{{else}}n/a{{end}}</div></div>
+  <div class="card"><div class="k">Last poll</div><div class="v">{{ts .PolledAt}}</div></div>
 </div>
 
-<div class="grid">
+<div class="grid" id="tiles">
 {{range .Topics}}
-<div class="tile">
-  <h2>{{.Name}}{{if .ConfirmedOver}} <span class="badge bad">over</span>{{end}}{{if .UnderRep}} <span class="badge bad">under-rep</span>{{end}}</h2>
+<a class="tile{{if or .ConfirmedOver .ReplicaConfirmed}} alert{{else if or .GrowthConfirmed (and .ThresholdBytes .WarnBytes (ge .StorageBytes (numv .WarnBytes)))}} watch{{end}}" data-name="{{.Name}}" href="{{$.BasePath}}/topic/{{.Name}}">
+  <h2>
+    {{.Name}}
+    {{if .ConfirmedOver}}<span class="badge bad">over limit</span>{{end}}
+    {{if .ReplicaConfirmed}}<span class="badge bad">replicas degraded</span>{{else if .UnderRep}}<span class="badge bad">{{.UnderRep}} under-rep</span>{{end}}
+    {{if .Offline}}<span class="badge bad">{{.Offline}} offline</span>{{end}}
+    {{if .GrowthConfirmed}}<span class="badge warn">growth over limit</span>{{end}}
+  </h2>
   <div class="size">{{bytes .StorageBytes}}</div>
-  <div class="bar"><div class="fill" style="width: {{pct .StorageBytes $.TotalBytes}}"></div></div>
+  <div class="bar"><div class="fill" style="width:{{pct .StorageBytes $.TotalBytes}}"></div></div>
   <div class="dets">
-    <span>{{.Partitions}} partitions</span>
+    <span>{{.Partitions}} parts</span>
     <span>RF {{rf .Replicas .Partitions}}</span>
-    <span>growth {{growth .GrowthPerHour}}</span>
+    <span>{{growth .GrowthPerHour}}</span>
+    {{if .HoursToLimit}}<span class="warn">~{{numv .HoursToLimit}}h to limit</span>{{end}}
   </div>
-</div>
+</a>
 {{else}}
-<div class="tile"><h2>No topics yet</h2><div class="meta">Waiting for the first successful poll…</div></div>
+<div class="tile"><h2>No topics yet</h2><div class="dets">Waiting for the first successful poll.</div></div>
 {{end}}
 </div>
+<div class="empty" id="filter-empty" hidden>No topics match the filter.</div>
 
-<div class="brokers">
+<div class="chips" style="margin-top:22px">
 {{range .Brokers}}
-  <span>broker {{.ID}}{{if .Host}} ({{.Host}}){{end}} — {{bytes .Bytes}} · {{.Partitions}} copies</span>
+  <span class="chip">
+    <b>{{bytes .Bytes}}</b>
+    <span>broker {{.ID}}, {{.Partitions}} copies</span>
+  </span>
 {{end}}
 </div>
 
-<footer>Storage = all replica copies (DescribeLogDirs). Auto-refresh 60s.</footer>
+<footer class="foot">Storage counts every replica copy reported by DescribeLogDirs. Refreshes every 60 seconds.</footer>
 </div>
+
+<script>
+(function () {
+  var input = document.getElementById("filter");
+  if (!input) return;
+  var items = Array.prototype.slice.call(document.querySelectorAll("[data-name]"));
+  var count = document.getElementById("filter-count");
+  var empty = document.getElementById("filter-empty");
+  function apply() {
+    var q = input.value.trim().toLowerCase();
+    var shown = 0;
+    for (var i = 0; i < items.length; i++) {
+      var hit = q === "" || items[i].getAttribute("data-name").toLowerCase().indexOf(q) !== -1;
+      items[i].hidden = !hit;
+      if (hit) shown++;
+    }
+    if (count) count.textContent = q === "" ? items.length + " topics" : shown + " of " + items.length;
+    if (empty) empty.hidden = shown !== 0;
+  }
+  input.addEventListener("input", apply);
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { input.value = ""; apply(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    var tag = document.activeElement ? document.activeElement.tagName : "";
+    if (e.key === "/" && tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
+      e.preventDefault();
+      input.focus();
+    }
+  });
+  apply();
+})();
+</script>
 </body>
 </html>

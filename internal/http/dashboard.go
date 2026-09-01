@@ -3,6 +3,7 @@ package http
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -22,16 +23,31 @@ type pageData struct {
 	LastError    string
 	TotalBytes   int64
 	Topics       []poller.TopicView
+
+	Sort             string // active dashboard sort: size (default), growth, skew, name
+	ErrKind          string // auth | timeout | network when PollOK is false
+	ErrHint          string // required-ACL guidance for auth failures
+	SkewConfirmed    bool
+	SkewHotID        int32
+	SkewShare        string // hottest broker's share, e.g. "64.2%"
+	TotalBrokerBytes int64
 }
 
 // --- dashboards ---
 
-func (s *Server) handleDashboard(w http.ResponseWriter, _ *http.Request) {
-	s.render(w, "dashboard.html", s.dashboardData())
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	pd := s.dashboardData()
+	pd.Sort = sortKey(r)
+	pd.Topics = sortTopics(pd.Topics, pd.Sort)
+	s.render(w, "dashboard.html", pd)
 }
 
+// handleWallboard orders by severity first (confirmed problems on top),
+// then size: a wallboard earns its keep when the red tiles sit together.
 func (s *Server) handleWallboard(w http.ResponseWriter, _ *http.Request) {
-	s.render(w, "wallboard.html", s.dashboardData())
+	pd := s.dashboardData()
+	pd.Topics = wallboardOrder(pd.Topics)
+	s.render(w, "wallboard.html", pd)
 }
 
 func (s *Server) handleTopicPage(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +75,124 @@ func (s *Server) handleTopicPage(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "topic.html", data)
 }
 
+// hostedTopicRow is one topic with replica copies on the drilled-down broker.
+type hostedTopicRow struct {
+	Name        string
+	Copies      int
+	LeaderParts int
+	LeaderBytes int64
+}
+
+// leaderPartitionRow is one partition led by the drilled-down broker.
+type leaderPartitionRow struct {
+	Topic     string
+	Partition int32
+	SizeBytes int64
+}
+
+// handleBrokerPage renders the per-broker drill-down (#9): what the broker
+// holds, computed from the same DescribeLogDirs + Metadata payload the
+// poller already paid for. No extra Kafka calls.
+func (s *Server) handleBrokerPage(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 32)
+	if err != nil {
+		http.Error(w, "unknown broker", http.StatusNotFound)
+		return
+	}
+	snap := s.deps.Snapshots.Snapshot()
+	var broker *apiBroker
+	var totalBrokerBytes int64
+	for _, b := range snap.Brokers {
+		totalBrokerBytes += b.Bytes
+		if b.ID == int32(id) {
+			broker = &apiBroker{ID: b.ID, Host: b.Host, Bytes: b.Bytes, Partitions: b.Partitions}
+		}
+	}
+	if broker == nil {
+		http.Error(w, "unknown broker", http.StatusNotFound)
+		return
+	}
+
+	hosted := map[string]*hostedTopicRow{}
+	var leaders []leaderPartitionRow
+	var leaderParts int
+	var leaderBytes int64
+	for _, t := range snap.Topics {
+		for _, pu := range t.Parts {
+			onBroker := pu.Leader == int32(id)
+			for _, rp := range pu.Replicas {
+				if rp == int32(id) {
+					onBroker = true
+					break
+				}
+			}
+			if !onBroker {
+				continue
+			}
+			row := hosted[t.Name]
+			if row == nil {
+				row = &hostedTopicRow{Name: t.Name}
+				hosted[t.Name] = row
+			}
+			row.Copies++
+			if pu.Leader == int32(id) {
+				row.LeaderParts++
+				row.LeaderBytes += pu.SizeBytes
+				leaderParts++
+				leaderBytes += pu.SizeBytes
+				leaders = append(leaders, leaderPartitionRow{Topic: t.Name, Partition: pu.Partition, SizeBytes: pu.SizeBytes})
+			}
+		}
+	}
+	hostedRows := make([]hostedTopicRow, 0, len(hosted))
+	for _, row := range hosted {
+		hostedRows = append(hostedRows, *row)
+	}
+	sort.Slice(hostedRows, func(i, j int) bool {
+		if hostedRows[i].LeaderBytes != hostedRows[j].LeaderBytes {
+			return hostedRows[i].LeaderBytes > hostedRows[j].LeaderBytes
+		}
+		return hostedRows[i].Name < hostedRows[j].Name
+	})
+	sort.Slice(leaders, func(i, j int) bool {
+		if leaders[i].SizeBytes != leaders[j].SizeBytes {
+			return leaders[i].SizeBytes > leaders[j].SizeBytes
+		}
+		return leaders[i].Topic < leaders[j].Topic
+	})
+	const maxLeaderRows = 25
+	leaderTruncated := len(leaders) > maxLeaderRows
+	if leaderTruncated {
+		leaders = leaders[:maxLeaderRows]
+	}
+
+	share := "0.0%"
+	if totalBrokerBytes > 0 {
+		share = fmt.Sprintf("%.1f%%", float64(broker.Bytes)/float64(totalBrokerBytes)*100)
+	}
+
+	data := struct {
+		pageData
+		Broker          apiBroker
+		Share           string
+		Hosted          []hostedTopicRow
+		Leaders         []leaderPartitionRow
+		LeaderParts     int
+		LeaderBytes     int64
+		LeaderTruncated bool
+	}{
+		pageData:        s.dashboardData(),
+		Broker:          *broker,
+		Share:           share,
+		Hosted:          hostedRows,
+		Leaders:         leaders,
+		LeaderParts:     leaderParts,
+		LeaderBytes:     leaderBytes,
+		LeaderTruncated: leaderTruncated,
+	}
+	s.render(w, "broker.html", data)
+}
+
 func (s *Server) render(w http.ResponseWriter, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
@@ -80,18 +214,97 @@ func (s *Server) dashboardData() pageData {
 		TotalBytes:   snap.TotalBytes,
 		Topics:       snap.Topics,
 		Brokers:      make([]apiBroker, 0, len(snap.Brokers)),
+
+		SkewConfirmed: snap.SkewConfirmed,
+		SkewHotID:     snap.SkewBrokerID,
+		SkewShare:     fmt.Sprintf("%.1f%%", snap.SkewSharePct),
 	}
 	for _, b := range snap.Brokers {
+		pd.TotalBrokerBytes += b.Bytes
 		pd.Brokers = append(pd.Brokers, apiBroker{
 			ID: b.ID, Host: b.Host, Bytes: b.Bytes, Partitions: b.Partitions,
 		})
 	}
+	if !snap.PollOK {
+		pd.ErrKind = string(classifyErr(snap.LastError))
+		if pd.ErrKind == string(errAuth) {
+			pd.ErrHint = authHint
+		}
+	}
 	return pd
+}
+
+// sortKey whitelists the dashboard sort query param.
+func sortKey(r *http.Request) string {
+	switch r.URL.Query().Get("sort") {
+	case "growth", "skew", "name":
+		return r.URL.Query().Get("sort")
+	default:
+		return "size"
+	}
+}
+
+func sortTopics(ts []poller.TopicView, key string) []poller.TopicView {
+	out := append([]poller.TopicView{}, ts...)
+	switch key {
+	case "name":
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	case "growth":
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].GrowthPerHour != out[j].GrowthPerHour {
+				return out[i].GrowthPerHour > out[j].GrowthPerHour
+			}
+			return out[i].StorageBytes > out[j].StorageBytes
+		})
+	case "skew":
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].PartitionSkew != out[j].PartitionSkew {
+				return out[i].PartitionSkew > out[j].PartitionSkew
+			}
+			return out[i].StorageBytes > out[j].StorageBytes
+		})
+	default: // size
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].StorageBytes != out[j].StorageBytes {
+				return out[i].StorageBytes > out[j].StorageBytes
+			}
+			return out[i].Name < out[j].Name
+		})
+	}
+	return out
+}
+
+// wallboardOrder puts confirmed problems first, then warnings, then the rest
+// by size, so a glance at the top of the wall is a triage.
+func wallboardOrder(ts []poller.TopicView) []poller.TopicView {
+	out := append([]poller.TopicView{}, ts...)
+	rank := func(t poller.TopicView) int {
+		switch {
+		case t.ConfirmedOver || t.ReplicaConfirmed:
+			return 0
+		case t.GrowthConfirmed:
+			return 1
+		case t.ThresholdBytes != nil && t.WarnBytes != nil && t.StorageBytes >= numValue(t.WarnBytes):
+			return 2
+		case t.UnderRep > 0 || t.Offline > 0:
+			return 3
+		default:
+			return 4
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := rank(out[i]), rank(out[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return out[i].StorageBytes > out[j].StorageBytes
+	})
+	return out
 }
 
 // --- threshold forms ---
 
-// handleThresholdForm accepts a plain HTML form post (dashboard actions)
+// handleThresholdForm accepts a plain HTML form post (topic page actions)
 // and redirects back to the dashboard.
 func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
 	redirect := func() {
@@ -116,14 +329,23 @@ func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
 		}
 		warn = &v
 	}
-	if err := s.setThreshold(r, thresholdRequest{Topic: topic, ThresholdBytes: limit, WarnBytes: warn}); err != nil {
+	var growth *int64
+	if gS := r.Form.Get("growth_bytes_per_hour"); gS != "" {
+		v, err := strconv.ParseInt(gS, 10, 64)
+		if err != nil {
+			http.Error(w, "growth threshold must be an integer number of bytes per hour", http.StatusBadRequest)
+			return
+		}
+		growth = &v
+	}
+	if err := s.setThreshold(r, thresholdRequest{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, GrowthPerHour: growth}); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	redirect()
 }
 
-// handleThresholdDeleteForm removes a threshold from the dashboard UI.
+// handleThresholdDeleteForm removes a threshold from the UI.
 func (s *Server) handleThresholdDeleteForm(w http.ResponseWriter, r *http.Request) {
 	redirect := func() {
 		http.Redirect(w, r, s.deps.BasePath+"/", http.StatusSeeOther)
@@ -168,10 +390,12 @@ func HumanBytes(n int64) string {
 	return sign + fmt.Sprintf("%.1f %ciB", float64(abs)/float64(div), "KMGTPE"[exp])
 }
 
-// Growth renders a bytes/hour rate with sign, e.g. "+3.2 MiB/hr".
+// Growth renders a bytes/hour rate with sign, e.g. "+3.2 MiB/hr". A zero
+// rate renders as the word "flat": it means the window saw no net change,
+// not that the value is missing.
 func Growth(perHour int64) string {
 	if perHour == 0 {
-		return "—"
+		return "flat"
 	}
 	sign := "+"
 	if perHour < 0 {
@@ -204,16 +428,25 @@ func numValue(p *int64) int64 {
 	return *p
 }
 
+// partSkew renders the max/avg partition-size ratio as "2.4x", or "-" when
+// the topic has too few sized partitions to say anything.
+func partSkew(f float64) string {
+	if f <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1fx", f)
+}
+
 func ts(t time.Time) string {
 	if t.IsZero() {
-		return "—"
+		return "n/a"
 	}
 	return t.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 func age(t time.Time) string {
 	if t.IsZero() {
-		return "—"
+		return "n/a"
 	}
 	d := time.Since(t)
 	switch {

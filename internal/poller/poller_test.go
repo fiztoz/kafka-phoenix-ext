@@ -65,10 +65,10 @@ func (f *fakeStore) States(context.Context) ([]store.StateRow, error) {
 	return out, nil
 }
 
-func (f *fakeStore) SetThreshold(_ context.Context, topic string, limit int64, warn *int64) error {
+func (f *fakeStore) SetThreshold(_ context.Context, topic string, limit int64, warn, growth *int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.thresholds[topic] = store.ThresholdRow{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, UpdatedAt: time.Now()}
+	f.thresholds[topic] = store.ThresholdRow{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, GrowthPerHour: growth, UpdatedAt: time.Now()}
 	return nil
 }
 
@@ -90,7 +90,11 @@ func (f *fakeStore) Thresholds(context.Context) (map[string]store.ThresholdRow, 
 }
 
 func (f *fakeStore) setThreshold(topic string, limit int64) error {
-	return f.SetThreshold(context.Background(), topic, limit, nil)
+	return f.SetThreshold(context.Background(), topic, limit, nil, nil)
+}
+
+func (f *fakeStore) setGrowthThreshold(topic string, limit int64, growth int64) error {
+	return f.SetThreshold(context.Background(), topic, limit, nil, &growth)
 }
 
 func (f *fakeStore) Migrate(context.Context) error { return nil }
@@ -118,7 +122,7 @@ func cluster(topic string, bytes int64) *kafka.ClusterSnapshot {
 
 func newTestPoller(ctx context.Context, t *testing.T, src *fakeSource, st *fakeStore) *Poller {
 	t.Helper()
-	p := New(ctx, src, st, kafka.DescribeOptions{}, time.Minute, discardLog())
+	p := New(ctx, src, st, kafka.DescribeOptions{}, SkewPolicy{SharePct: 60}, time.Minute, discardLog())
 	p.now = func() time.Time { return testNow }
 	return p
 }
@@ -262,5 +266,179 @@ func TestSeedsFromStore(t *testing.T) {
 	}
 	if !snap.Topics[0].ConfirmedOver {
 		t.Fatal("confirmed_over lost across restart")
+	}
+}
+
+func clusterUnderRep(topic string, bytes int64) *kafka.ClusterSnapshot {
+	c := cluster(topic, bytes)
+	c.Topics[0].UnderRep = 1
+	c.Topics[0].Parts[0].UnderRep = true
+	c.Topics[0].Parts[0].ISR = []int32{1}
+	return c
+}
+
+func TestReplicaHysteresis(t *testing.T) {
+	ctx := context.Background()
+	src := &fakeSource{}
+	st := newFakeStore()
+	p := newTestPoller(ctx, t, src, st)
+
+	src.set(clusterUnderRep("orders", 1000))
+	p.tick(ctx)
+	tv := p.Snapshot().Topics[0]
+	if tv.RepStreak != 1 || tv.ReplicaConfirmed {
+		t.Fatalf("tick1: streak=%d confirmed=%v", tv.RepStreak, tv.ReplicaConfirmed)
+	}
+
+	p.tick(ctx)
+	tv = p.Snapshot().Topics[0]
+	if tv.RepStreak != 2 || !tv.ReplicaConfirmed {
+		t.Fatalf("tick2: streak=%d confirmed=%v", tv.RepStreak, tv.ReplicaConfirmed)
+	}
+
+	src.set(cluster("orders", 1000))
+	p.tick(ctx)
+	tv = p.Snapshot().Topics[0]
+	if tv.RepStreak != 0 || tv.ReplicaConfirmed {
+		t.Fatalf("tick3: streak=%d confirmed=%v", tv.RepStreak, tv.ReplicaConfirmed)
+	}
+}
+
+func TestGrowthThresholdHysteresisAndWindow(t *testing.T) {
+	ctx := context.Background()
+	src := &fakeSource{}
+	st := newFakeStore()
+	if err := st.setGrowthThreshold("orders", 1_000_000, 150); err != nil {
+		t.Fatal(err)
+	}
+	p := newTestPoller(ctx, t, src, st)
+
+	src.set(cluster("orders", 1000))
+	p.tick(ctx) // one sample: no growth yet
+	tv := p.Snapshot().Topics[0]
+	if tv.GrowthPerHour != 0 || tv.GrowthStreak != 0 || tv.GrowthConfirmed {
+		t.Fatalf("tick1: %+v", tv)
+	}
+	if tv.GrowthThreshold == nil || *tv.GrowthThreshold != 150 {
+		t.Fatalf("growth threshold not surfaced: %+v", tv.GrowthThreshold)
+	}
+
+	testNow = testNow.Add(time.Hour)
+	src.set(cluster("orders", 1200))
+	p.tick(ctx) // growth 200/hr >= 150: streak 1, not confirmed
+	tv = p.Snapshot().Topics[0]
+	if tv.GrowthPerHour != 200 || tv.GrowthStreak != 1 || tv.GrowthConfirmed {
+		t.Fatalf("tick2: growth=%d streak=%d confirmed=%v", tv.GrowthPerHour, tv.GrowthStreak, tv.GrowthConfirmed)
+	}
+
+	testNow = testNow.Add(time.Hour)
+	src.set(cluster("orders", 1500))
+	p.tick(ctx) // window growth (1500-1000)/2h = 250: confirmed
+	tv = p.Snapshot().Topics[0]
+	if tv.GrowthPerHour != 250 || !tv.GrowthConfirmed {
+		t.Fatalf("tick3: growth=%d confirmed=%v", tv.GrowthPerHour, tv.GrowthConfirmed)
+	}
+
+	testNow = testNow.Add(time.Hour)
+	src.set(cluster("orders", 1300))
+	p.tick(ctx) // dip: window growth (1300-1000)/3h = 100 < 150: clears
+	tv = p.Snapshot().Topics[0]
+	if tv.GrowthPerHour != 100 || tv.GrowthConfirmed || tv.GrowthStreak != 0 {
+		t.Fatalf("tick4: growth=%d streak=%d confirmed=%v", tv.GrowthPerHour, tv.GrowthStreak, tv.GrowthConfirmed)
+	}
+}
+
+func TestHoursToLimitForecast(t *testing.T) {
+	ctx := context.Background()
+	src := &fakeSource{}
+	st := newFakeStore()
+	if err := st.setThreshold("orders", 10000); err != nil {
+		t.Fatal(err)
+	}
+	p := newTestPoller(ctx, t, src, st)
+
+	src.set(cluster("orders", 2000))
+	p.tick(ctx)
+	testNow = testNow.Add(time.Hour)
+	src.set(cluster("orders", 4000))
+	p.tick(ctx) // growth 2000/hr, 6000 bytes of headroom: 3h to limit
+	tv := p.Snapshot().Topics[0]
+	if tv.HoursToLimit == nil || *tv.HoursToLimit != 3 {
+		t.Fatalf("hours to limit: %+v", tv.HoursToLimit)
+	}
+
+	// Negative growth hides the forecast instead of extrapolating backwards.
+	testNow = testNow.Add(time.Hour)
+	src.set(cluster("orders", 1000))
+	p.tick(ctx)
+	tv = p.Snapshot().Topics[0]
+	if tv.HoursToLimit != nil {
+		t.Fatalf("negative growth should hide the forecast, got %+v", *tv.HoursToLimit)
+	}
+}
+
+func TestPartitionSkew(t *testing.T) {
+	c := cluster("orders", 1200)
+	c.Topics[0].Parts = []kafka.PartitionUse{
+		{Partition: 0, Leader: 1, SizeBytes: 900},
+		{Partition: 1, Leader: 1, SizeBytes: 100},
+		{Partition: 2, Leader: 1, SizeBytes: 200},
+	}
+	if got := partitionSkew(c.Topics[0].Parts); got < 2.24 || got > 2.26 {
+		t.Fatalf("partition skew = %f, want ~2.25 (900/400)", got)
+	}
+	if got := partitionSkew(c.Topics[0].Parts[:1]); got != 0 {
+		t.Fatalf("single partition skew = %f, want 0", got)
+	}
+}
+
+func clusterSkewed() *kafka.ClusterSnapshot {
+	return &kafka.ClusterSnapshot{
+		ClusterID:    "c1",
+		ControllerID: 1,
+		Brokers: []kafka.BrokerUse{
+			{ID: 1, Host: "kafka-1", Bytes: 900, Partitions: 3},
+			{ID: 2, Host: "kafka-2", Bytes: 100, Partitions: 3},
+		},
+		Topics: []kafka.TopicUse{
+			{
+				Name: "orders", Partitions: 1, Replicas: 2,
+				StorageBytes: 1000, LeaderBytes: 500,
+				Parts: []kafka.PartitionUse{{Partition: 0, Leader: 1, Replicas: []int32{1, 2}, ISR: []int32{1, 2}, SizeBytes: 500}},
+			},
+		},
+		TotalBytes: 1000,
+	}
+}
+
+func TestBrokerSkewHysteresis(t *testing.T) {
+	ctx := context.Background()
+	src := &fakeSource{}
+	st := newFakeStore()
+	p := newTestPoller(ctx, t, src, st) // policy: 60% share
+
+	src.set(clusterSkewed())
+	p.tick(ctx)
+	snap := p.Snapshot()
+	if snap.SkewStreak != 1 || snap.SkewConfirmed {
+		t.Fatalf("tick1: streak=%d confirmed=%v", snap.SkewStreak, snap.SkewConfirmed)
+	}
+	if snap.SkewBrokerID != 1 || snap.SkewSharePct < 89.9 || snap.SkewSharePct > 90.1 {
+		t.Fatalf("hot broker: id=%d share=%.1f", snap.SkewBrokerID, snap.SkewSharePct)
+	}
+
+	p.tick(ctx)
+	if snap = p.Snapshot(); !snap.SkewConfirmed {
+		t.Fatalf("tick2: skew should be confirmed, streak=%d", snap.SkewStreak)
+	}
+
+	// Balanced cluster clears it.
+	balanced := clusterSkewed()
+	balanced.Brokers[0].Bytes = 500
+	balanced.Brokers[1].Bytes = 500
+	src.set(balanced)
+	p.tick(ctx)
+	if snap = p.Snapshot(); snap.SkewConfirmed || snap.SkewStreak != 0 {
+		t.Fatalf("tick3: streak=%d confirmed=%v", snap.SkewStreak, snap.SkewConfirmed)
 	}
 }

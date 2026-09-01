@@ -27,6 +27,9 @@ type Config struct {
 	PollInterval time.Duration `env:"KAFKA_POLL_INTERVAL" envDefault:"15m"`
 	KafkaTimeout time.Duration `env:"KAFKA_TIMEOUT" envDefault:"45s"`
 
+	BrokerSkewPct  int   `env:"KAFKA_BROKER_SKEW_PCT" envDefault:"60"` // one broker holding more than this % of cluster bytes is skew
+	BrokerMaxBytes int64 `env:"KAFKA_BROKER_MAX_BYTES" envDefault:"0"` // absolute per-broker byte limit; 0 disables
+
 	ListenAddr     string `env:"LISTEN_ADDR" envDefault:":8080"`
 	DatabaseDSN    string `env:"DATABASE_DSN,required"` // MariaDB DSN or file:/data/kafka-phoenix-ext.db
 	DatabaseEngine string `env:"DATABASE_ENGINE"`       // mariadb | sqlite; inferred when empty
@@ -73,6 +76,13 @@ func Load() (*Config, error) {
 	}
 	if cfg.KafkaTimeout <= 0 || cfg.KafkaTimeout > 10*time.Minute {
 		return nil, fmt.Errorf("config: KAFKA_TIMEOUT must be in (0, 10m], got %s", cfg.KafkaTimeout)
+	}
+
+	if cfg.BrokerSkewPct < 1 || cfg.BrokerSkewPct > 100 {
+		return nil, fmt.Errorf("config: KAFKA_BROKER_SKEW_PCT must be in [1, 100], got %d", cfg.BrokerSkewPct)
+	}
+	if cfg.BrokerMaxBytes < 0 {
+		return nil, fmt.Errorf("config: KAFKA_BROKER_MAX_BYTES must be >= 0 (0 disables), got %d", cfg.BrokerMaxBytes)
 	}
 
 	cfg.TopicFilter = strings.TrimSpace(cfg.TopicFilter)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,15 +90,16 @@ func (m *MariaDB) States(ctx context.Context) ([]StateRow, error) {
 	return queryStates(ctx, m.db)
 }
 
-func (m *MariaDB) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes *int64) error {
+func (m *MariaDB) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error {
 	_, err := m.db.ExecContext(ctx, `
-INSERT INTO ext_kafka_usage_thresholds (topic, threshold_bytes, warn_bytes, updated_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO ext_kafka_usage_thresholds (topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at)
+VALUES (?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
   threshold_bytes = VALUES(threshold_bytes),
   warn_bytes = VALUES(warn_bytes),
+  growth_bytes_per_hour = VALUES(growth_bytes_per_hour),
   updated_at = VALUES(updated_at)`,
-		topic, thresholdBytes, warnBytes, time.Now().UTC())
+		topic, thresholdBytes, warnBytes, growthPerHour, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("store: set threshold %s: %w", topic, err)
 	}
@@ -154,7 +156,7 @@ func queryStates(ctx context.Context, db *sql.DB) ([]StateRow, error) {
 
 func queryThresholds(ctx context.Context, db *sql.DB) (map[string]ThresholdRow, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT topic, threshold_bytes, warn_bytes, updated_at FROM ext_kafka_usage_thresholds`)
+		`SELECT topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at FROM ext_kafka_usage_thresholds`)
 	if err != nil {
 		return nil, fmt.Errorf("store: query thresholds: %w", err)
 	}
@@ -162,19 +164,13 @@ func queryThresholds(ctx context.Context, db *sql.DB) (map[string]ThresholdRow, 
 	out := make(map[string]ThresholdRow)
 	for rows.Next() {
 		var q ThresholdRow
-		var warn any
+		var warn, growth any
 		var updated any
-		if err := rows.Scan(&q.Topic, &q.ThresholdBytes, &warn, &updated); err != nil {
+		if err := rows.Scan(&q.Topic, &q.ThresholdBytes, &warn, &growth, &updated); err != nil {
 			return nil, fmt.Errorf("store: scan threshold: %w", err)
 		}
-		switch x := warn.(type) {
-		case int64:
-			v := x
-			q.WarnBytes = &v
-		case []byte:
-			q.WarnBytes = parseWarn(x)
-		case nil:
-		}
+		q.WarnBytes = scanNullableInt(warn)
+		q.GrowthPerHour = scanNullableInt(growth)
 		if ut, err := scanTime(updated); err == nil && ut != nil {
 			q.UpdatedAt = *ut
 		}
@@ -183,13 +179,31 @@ func queryThresholds(ctx context.Context, db *sql.DB) (map[string]ThresholdRow, 
 	return out, rows.Err()
 }
 
-func parseWarn(b []byte) *int64 {
-	var v int64
-	s := string(b)
+// scanNullableInt maps a nullable integer column (int64, []byte, string or
+// NULL across the two drivers) to *int64.
+func scanNullableInt(v any) *int64 {
+	switch x := v.(type) {
+	case nil:
+		return nil
+	case int64:
+		val := x
+		return &val
+	case []byte:
+		return parseIntBytes(x)
+	case string:
+		return parseIntBytes([]byte(x))
+	default:
+		return nil
+	}
+}
+
+func parseIntBytes(b []byte) *int64 {
+	s := strings.TrimSpace(string(b))
 	if s == "" {
 		return nil
 	}
-	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
 		return nil
 	}
 	return &v

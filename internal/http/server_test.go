@@ -49,10 +49,10 @@ func (f *fakeStore) Close() error                  { return nil }
 func (f *fakeStore) UpsertStates(context.Context, []store.StateRow) error { return nil }
 func (f *fakeStore) States(context.Context) ([]store.StateRow, error)     { return nil, nil }
 
-func (f *fakeStore) SetThreshold(_ context.Context, topic string, limit int64, warn *int64) error {
+func (f *fakeStore) SetThreshold(_ context.Context, topic string, limit int64, warn, growth *int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.thresholds[topic] = store.ThresholdRow{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, UpdatedAt: time.Now()}
+	f.thresholds[topic] = store.ThresholdRow{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, GrowthPerHour: growth, UpdatedAt: time.Now()}
 	return nil
 }
 
@@ -362,5 +362,147 @@ func TestRootPathConvenience(t *testing.T) {
 	w := do(t, srv.Handler(), http.MethodGet, "/health/live", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("root health: %d", w.Code)
+	}
+}
+
+func TestHealthReplicasGrowthBrokers(t *testing.T) {
+	// Baseline snapshot has under-rep partitions but no confirmed streak.
+	srv, fs, _ := newTestServer(t, sampleSnapshot(), "")
+	w := do(t, srv.Handler(), http.MethodGet, "/kafka/health/replicas", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("replicas ok: %d %q", w.Code, w.Body.String())
+	}
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/health/growth", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("growth ok: %d %q", w.Code, w.Body.String())
+	}
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/health/brokers", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("brokers ok: %d %q", w.Code, w.Body.String())
+	}
+
+	bad := sampleSnapshot()
+	bad.Topics[0].ReplicaConfirmed = true
+	bad.Topics[0].RepStreak = 2
+	bad.Topics[1].GrowthConfirmed = true
+	bad.Topics[1].GrowthStreak = 2
+	growth := int64(64)
+	bad.Topics[1].GrowthThreshold = &growth
+	bad.Topics[1].GrowthPerHour = 128
+	bad.SkewConfirmed = true
+	bad.SkewStreak = 2
+	bad.SkewBrokerID = 0
+	bad.SkewSharePct = 82.5
+	fs.set(bad)
+
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/health/replicas", nil, nil)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "orders") {
+		t.Fatalf("replicas bad: %d %q", w.Code, w.Body.String())
+	}
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/health/growth", nil, nil)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "events") {
+		t.Fatalf("growth bad: %d %q", w.Code, w.Body.String())
+	}
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/health/brokers", nil, nil)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "broker 0") {
+		t.Fatalf("brokers bad: %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestHealthReadyClassifiesAuthErrors(t *testing.T) {
+	failing := sampleSnapshot()
+	failing.PollOK = false
+	failing.LastError = "kafka: describe log dirs: CLUSTER_AUTHORIZATION_FAILED (31)"
+	srv, _, _ := newTestServer(t, failing, "")
+
+	w := do(t, srv.Handler(), http.MethodGet, "/kafka/health/ready", nil, nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ready: %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "missing ACLs") || strings.Contains(body, "unreachable") {
+		t.Fatalf("auth error must be classified, got %q", body)
+	}
+}
+
+func TestAPIBrokersAndBrokerPage(t *testing.T) {
+	srv, _, _ := newTestServer(t, sampleSnapshot(), "")
+
+	w := do(t, srv.Handler(), http.MethodGet, "/kafka/api/brokers", nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("api brokers: %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"total_broker_bytes":1536`, `"id":0`, `"share_pct":100`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("api brokers missing %s: %s", want, body)
+		}
+	}
+
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/broker/0", nil, nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "kafka-0") || !strings.Contains(w.Body.String(), "orders") {
+		t.Fatalf("broker page: %d", w.Code)
+	}
+
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/broker/99", nil, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown broker: %d", w.Code)
+	}
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/broker/abc", nil, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("bad broker id: %d", w.Code)
+	}
+}
+
+func TestGrowthThresholdRoundTrip(t *testing.T) {
+	srv, _, st := newTestServer(t, sampleSnapshot(), "")
+
+	// Form post with a growth limit.
+	form := "topic=events&threshold_bytes=2048&growth_bytes_per_hour=128"
+	w := do(t, srv.Handler(), http.MethodPost, "/kafka/thresholds",
+		map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, strings.NewReader(form))
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("form set: %d %s", w.Code, w.Body.String())
+	}
+	row, ok := st.thresholds["events"]
+	if !ok || row.GrowthPerHour == nil || *row.GrowthPerHour != 128 {
+		t.Fatalf("growth threshold not stored: %+v", row)
+	}
+
+	// API: growth limit must be positive.
+	w = do(t, srv.Handler(), http.MethodPost, "/kafka/api/thresholds",
+		nil, strings.NewReader(`{"topic":"events","threshold_bytes":1024,"growth_bytes_per_hour":0}`))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("zero growth limit: %d", w.Code)
+	}
+
+	// API: growth limit round-trips in the set response.
+	w = do(t, srv.Handler(), http.MethodPost, "/kafka/api/thresholds",
+		nil, strings.NewReader(`{"topic":"events","threshold_bytes":2048,"growth_bytes_per_hour":256}`))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"growth_bytes_per_hour":256`) {
+		t.Fatalf("api set growth: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDashboardHasSearchAndWallboardEntry(t *testing.T) {
+	srv, _, _ := newTestServer(t, sampleSnapshot(), "")
+
+	w := do(t, srv.Handler(), http.MethodGet, "/kafka/", nil, nil)
+	body := w.Body.String()
+	for _, want := range []string{`id="filter"`, `href="/kafka/wallboard"`, `data-name="orders"`, `?sort=growth`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("dashboard missing %s", want)
+		}
+	}
+
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/wallboard", nil, nil)
+	if !strings.Contains(w.Body.String(), `href="/kafka/"`) || !strings.Contains(w.Body.String(), `data-name="orders"`) {
+		t.Fatal("wallboard missing exit button or searchable tiles")
+	}
+
+	// Sorted view renders and stays valid input.
+	w = do(t, srv.Handler(), http.MethodGet, "/kafka/?sort=skew", nil, nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "orders") {
+		t.Fatalf("sort=skew: %d", w.Code)
 	}
 }

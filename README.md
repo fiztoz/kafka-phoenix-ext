@@ -23,8 +23,19 @@ endpoints).
 - Per broker: total bytes and hosted replica-copy count (disk balancing).
 - Per partition drill-down (`/topic/{name}`): leader, replicas, ISR, size,
   offset lag, under-replicated/offline flags.
+- Per broker drill-down (`/broker/{id}`): share of cluster bytes, hosted
+  topics and largest partitions led on that broker.
 - Operator-set **size thresholds** with 2-sample hysteresis → `/health/thresholds`
   goes 503 so a Phoenix HTTP monitor can alert; warn level below the limit.
+- Optional **growth thresholds** (bytes/hour over a rolling window) with
+  time-to-limit forecasts → `/health/growth`.
+- **Replica health** monitor: `/health/replicas` 503 when under-replicated or
+  offline partitions persist across polls.
+- **Broker skew** monitor: `/health/brokers` 503 when one broker holds more
+  than `KAFKA_BROKER_SKEW_PCT` of cluster bytes (or `KAFKA_BROKER_MAX_BYTES`).
+- Partition skew (max/avg leader partition size) per topic, sortable on the
+  dashboard; failed polls are classified (auth vs timeout vs network) with
+  the required ACLs shown next to auth errors.
 
 ## Local run (SQLite, no MariaDB needed)
 
@@ -44,6 +55,9 @@ Health probes (always open, no UI token):
 curl -s localhost:8080/health/live
 curl -s localhost:8080/health/ready        # 503 while Kafka unreachable
 curl -s localhost:8080/health/thresholds   # 503 when any topic confirmed over
+curl -s localhost:8080/health/replicas     # 503 on confirmed under-rep/offline
+curl -s localhost:8080/health/growth       # 503 on confirmed growth over limit
+curl -s localhost:8080/health/brokers      # 503 on confirmed broker skew
 ```
 
 ## Tests / lint
@@ -68,6 +82,8 @@ make vet
 | `KAFKA_TOPIC_FILTER` | no | `.*` | regexp; non-matching topics are hidden |
 | `KAFKA_POLL_INTERVAL` | no | `15m` | poll cadence; min `1m` |
 | `KAFKA_TIMEOUT` | no | `45s` | per-describe deadline; max `10m` |
+| `KAFKA_BROKER_SKEW_PCT` | no | `60` | one broker over this % of cluster bytes is skew (needs ≥2 brokers) |
+| `KAFKA_BROKER_MAX_BYTES` | no | `0` | absolute per-broker byte limit; `0` disables |
 | `DATABASE_DSN` | yes | — | MariaDB DSN or `file:` SQLite path |
 | `DATABASE_ENGINE` | no | inferred | `mariadb` \| `sqlite` |
 | `BASE_PATH` | no | `/kafka` | must equal the chart `path` value |
@@ -88,3 +104,6 @@ schema on startup (embedded migrations run before the first poll).
 The store auto-appends `parseTime=true&multiStatements=true` when missing.
 Chart integration (values.yaml example, port override, NetworkPolicy gotcha)
 is documented in [`docs/chart-wiring.md`](docs/chart-wiring.md).
+Suggested next features (consumer lag, replica/broker health monitors, and
+what is explicitly out of scope) live in
+[`docs/feature-suggestions.md`](docs/feature-suggestions.md).

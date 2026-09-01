@@ -83,15 +83,16 @@ func (s *SQLite) States(ctx context.Context) ([]StateRow, error) {
 	return queryStates(ctx, s.db)
 }
 
-func (s *SQLite) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes *int64) error {
+func (s *SQLite) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO ext_kafka_usage_thresholds (topic, threshold_bytes, warn_bytes, updated_at)
-VALUES (?, ?, ?, datetime('now'))
+INSERT INTO ext_kafka_usage_thresholds (topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at)
+VALUES (?, ?, ?, ?, datetime('now'))
 ON CONFLICT(topic) DO UPDATE SET
   threshold_bytes = excluded.threshold_bytes,
   warn_bytes = excluded.warn_bytes,
+  growth_bytes_per_hour = excluded.growth_bytes_per_hour,
   updated_at = excluded.updated_at`,
-		topic, thresholdBytes, warnBytes)
+		topic, thresholdBytes, warnBytes, growthPerHour)
 	if err != nil {
 		return fmt.Errorf("store: set threshold %s: %w", topic, err)
 	}

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -19,8 +20,8 @@ type Source interface {
 	Describe(ctx context.Context, o kafka.DescribeOptions) (*kafka.ClusterSnapshot, error)
 }
 
-// TopicView is one topic as shown to the HTTP layer, enriched with growth
-// and threshold state.
+// TopicView is one topic as shown to the HTTP layer, enriched with growth,
+// skew and threshold state.
 type TopicView struct {
 	Name         string
 	Partitions   int
@@ -34,13 +35,23 @@ type TopicView struct {
 
 	PrevBytes     int64     // previous good sample
 	PrevPolledAt  time.Time // zero when this is the first sample
-	GrowthPerHour int64     // (storage-prev)/hours; 0 when no prev sample
+	GrowthPerHour int64     // over the rolling window; 0 until two samples exist
+
+	HoursToLimit  *int64  // forecast at current growth; nil when not applicable
+	PartitionSkew float64 // max/avg leader partition size; 0 = unknown or uniform
 
 	Stale          bool
-	ThresholdBytes *int64 // operator-set limit
+	ThresholdBytes *int64 // operator-set size limit
 	WarnBytes      *int64 // optional; below ThresholdBytes
 	OverStreak     int    // consecutive polls at/over threshold
 	ConfirmedOver  bool   // OverStreak >= confirmSamples
+
+	GrowthThreshold *int64 // operator-set bytes/hour limit (optional)
+	GrowthStreak    int    // consecutive polls at/over growth threshold
+	GrowthConfirmed bool   // GrowthStreak >= confirmSamples
+
+	RepStreak        int  // consecutive polls with under-rep/offline partitions
+	ReplicaConfirmed bool // RepStreak >= confirmSamples
 }
 
 // Snapshot is the poller's last observation.
@@ -54,11 +65,29 @@ type Snapshot struct {
 	Topics       []TopicView
 	Brokers      []kafka.BrokerUse
 	BrokerErrors []string
+
+	SkewConfirmed bool    // hottest broker confirmed over the skew policy
+	SkewStreak    int     // consecutive polls over the skew policy
+	SkewBrokerID  int32   // hottest broker in the last sample (-1 = unknown)
+	SkewSharePct  float64 // hottest broker's share of broker-reported bytes
 }
 
-// confirmSamples is the hysteresis: a threshold must hold across this many
+// SkewPolicy is the broker disk-skew alert policy. SharePct is the share of
+// cluster bytes one broker may hold before it counts as skew (needs >= 2
+// brokers); MaxBytes is an absolute per-broker cap. Zero disables each arm.
+type SkewPolicy struct {
+	SharePct int
+	MaxBytes int64
+}
+
+// confirmSamples is the hysteresis: a condition must hold across this many
 // consecutive polls before it is treated as confirmed.
 const confirmSamples = 2
+
+// windowLen caps the in-memory growth window per topic. A short window keeps
+// a single compaction dip from flipping growth alerts while staying cheap;
+// long-term history belongs to Prometheus, not this process.
+const windowLen = 8
 
 type prevSample struct {
 	bytes int64
@@ -70,33 +99,42 @@ type Poller struct {
 	source   Source
 	store    store.Store
 	opts     kafka.DescribeOptions
+	skew     SkewPolicy
 	interval time.Duration
 	log      *slog.Logger
 
 	// now is injectable for tests.
 	now func() time.Time
 
-	mu         sync.RWMutex
-	snap       Snapshot
-	prev       map[string]prevSample
-	streaks    map[string]int
-	thresholds map[string]store.ThresholdRow
+	mu          sync.RWMutex
+	snap        Snapshot
+	prev        map[string]prevSample
+	windows     map[string][]prevSample
+	streaks     map[string]int
+	repStreaks  map[string]int
+	growStreaks map[string]int
+	skewStreak  int
+	thresholds  map[string]store.ThresholdRow
 }
 
 // New builds a Poller. The snapshot is seeded from durable store state so a
 // restart does not forget a confirmed over-threshold or the growth baseline.
-func New(ctx context.Context, source Source, st store.Store, opts kafka.DescribeOptions, interval time.Duration, log *slog.Logger) *Poller {
+func New(ctx context.Context, source Source, st store.Store, opts kafka.DescribeOptions, skew SkewPolicy, interval time.Duration, log *slog.Logger) *Poller {
 	p := &Poller{
-		source:     source,
-		store:      st,
-		opts:       opts,
-		interval:   interval,
-		log:        log,
-		now:        time.Now,
-		snap:       Snapshot{PollOK: false, ControllerID: -1},
-		prev:       map[string]prevSample{},
-		streaks:    map[string]int{},
-		thresholds: map[string]store.ThresholdRow{},
+		source:      source,
+		store:       st,
+		opts:        opts,
+		skew:        skew,
+		interval:    interval,
+		log:         log,
+		now:         time.Now,
+		snap:        Snapshot{PollOK: false, ControllerID: -1, SkewBrokerID: -1},
+		prev:        map[string]prevSample{},
+		windows:     map[string][]prevSample{},
+		streaks:     map[string]int{},
+		repStreaks:  map[string]int{},
+		growStreaks: map[string]int{},
+		thresholds:  map[string]store.ThresholdRow{},
 	}
 	if rows, err := st.States(ctx); err == nil {
 		p.seedFromState(rows)
@@ -116,9 +154,18 @@ func (p *Poller) seedFromState(rows []store.StateRow) {
 	for _, r := range rows {
 		p.prev[r.Topic] = prevSample{bytes: r.StorageBytes, at: r.PolledAt}
 		p.streaks[r.Topic] = r.OverStreak
+		win := []prevSample{}
+		if r.PrevPolledAt != nil && !r.PrevPolledAt.IsZero() {
+			win = append(win, prevSample{bytes: r.PrevBytes, at: *r.PrevPolledAt})
+		}
+		win = append(win, prevSample{bytes: r.StorageBytes, at: r.PolledAt})
+		p.windows[r.Topic] = win
 		tv := topicViewFromState(r)
 		p.snap.Topics = append(p.snap.Topics, tv)
 		p.snap.TotalBytes += r.StorageBytes
+		if r.PolledAt.After(p.snap.PolledAt) {
+			p.snap.PolledAt = r.PolledAt
+		}
 	}
 }
 
@@ -212,6 +259,8 @@ func (p *Poller) tick(ctx context.Context) {
 	}
 
 	// Build the fresh snapshot from the described cluster plus hysteresis.
+	// Windows/streaks are computed against provisional values first; they
+	// only become durable state after the store write succeeds (below).
 	p.snap = Snapshot{
 		ClusterID:    described.ClusterID,
 		ControllerID: described.ControllerID,
@@ -223,50 +272,80 @@ func (p *Poller) tick(ctx context.Context) {
 		BrokerErrors: described.BrokerErrors,
 		Topics:       make([]TopicView, 0, len(described.Topics)),
 	}
+	wins := make([][]prevSample, len(described.Topics))
+	repStreaks := make([]int, len(described.Topics))
+	growStreaks := make([]int, len(described.Topics))
 	for i := range described.Topics {
 		tu := described.Topics[i]
 		tv := TopicView{
-			Name:         tu.Name,
-			Partitions:   tu.Partitions,
-			Replicas:     tu.Replicas,
-			StorageBytes: tu.StorageBytes,
-			LeaderBytes:  tu.LeaderBytes,
-			IsInternal:   tu.IsInternal,
-			UnderRep:     tu.UnderRep,
-			Offline:      tu.Offline,
-			Parts:        tu.Parts,
+			Name:          tu.Name,
+			Partitions:    tu.Partitions,
+			Replicas:      tu.Replicas,
+			StorageBytes:  tu.StorageBytes,
+			LeaderBytes:   tu.LeaderBytes,
+			IsInternal:    tu.IsInternal,
+			UnderRep:      tu.UnderRep,
+			Offline:       tu.Offline,
+			Parts:         tu.Parts,
+			PartitionSkew: partitionSkew(tu.Parts),
 		}
-		if ps, ok := p.prev[tu.Name]; ok {
-			tv.PrevBytes = ps.bytes
-			if !ps.at.IsZero() {
-				tv.PrevPolledAt = ps.at
-				if hours := now.Sub(ps.at).Hours(); hours > 0 {
-					tv.GrowthPerHour = int64(float64(tu.StorageBytes-ps.bytes) / hours)
-				}
-			}
+
+		win := append(append([]prevSample{}, p.windows[tu.Name]...), prevSample{bytes: tu.StorageBytes, at: now})
+		if len(win) > windowLen {
+			win = win[len(win)-windowLen:]
 		}
+		wins[i] = win
+		tv.PrevBytes, tv.PrevPolledAt, tv.GrowthPerHour = growthFromWindow(win)
+
+		if tu.UnderRep > 0 || tu.Offline > 0 {
+			repStreaks[i] = p.repStreaks[tu.Name] + 1
+		}
+		tv.RepStreak = repStreaks[i]
+		tv.ReplicaConfirmed = repStreaks[i] >= confirmSamples
+
 		if thr, ok := p.thresholds[tu.Name]; ok {
 			tv.ThresholdBytes = &thr.ThresholdBytes
 			tv.WarnBytes = thr.WarnBytes
 			tv.OverStreak = rows[i].OverStreak
 			tv.ConfirmedOver = rows[i].ConfirmedOver
+			tv.GrowthThreshold = thr.GrowthPerHour
+			if thr.GrowthPerHour != nil && tv.GrowthPerHour >= *thr.GrowthPerHour {
+				growStreaks[i] = p.growStreaks[tu.Name] + 1
+			}
+			tv.GrowthStreak = growStreaks[i]
+			tv.GrowthConfirmed = growStreaks[i] >= confirmSamples
 		}
+		tv.HoursToLimit = hoursToLimit(tv.ThresholdBytes, tv.StorageBytes, tv.GrowthPerHour)
 		p.snap.Topics = append(p.snap.Topics, tv)
 	}
+
+	hotID, share, over := evaluateSkew(described.Brokers, p.skew)
+	skewStreak := 0
+	if over {
+		skewStreak = p.skewStreak + 1
+	}
+	p.snap.SkewBrokerID = hotID
+	p.snap.SkewSharePct = share
+	p.snap.SkewStreak = skewStreak
+	p.snap.SkewConfirmed = skewStreak >= confirmSamples
 	p.mu.Unlock()
 
 	if err := p.store.UpsertStates(ctx, rows); err != nil {
 		// Data is still fresh; only the durable state is a casualty. Do not
-		// advance prev/streaks so the next tick retries with the same
+		// advance prev/streaks/windows so the next tick retries with the same
 		// baseline and hysteresis counters.
 		p.log.Error("poller: could not persist states", "err", err)
 		return
 	}
 	p.mu.Lock()
-	for _, r := range rows {
+	for i, r := range rows {
 		p.prev[r.Topic] = prevSample{bytes: r.StorageBytes, at: r.PolledAt}
 		p.streaks[r.Topic] = r.OverStreak
+		p.repStreaks[r.Topic] = repStreaks[i]
+		p.growStreaks[r.Topic] = growStreaks[i]
+		p.windows[r.Topic] = wins[i]
 	}
+	p.skewStreak = skewStreak
 	p.mu.Unlock()
 
 	p.log.Debug("poller: tick complete", "topics", len(described.Topics),
@@ -302,6 +381,9 @@ func (p *Poller) applyThresholdsLocked() {
 			tv.WarnBytes = nil
 			tv.OverStreak = 0
 			tv.ConfirmedOver = false
+			tv.GrowthThreshold = nil
+			tv.GrowthStreak = 0
+			tv.GrowthConfirmed = false
 			continue
 		}
 		tv.ThresholdBytes = &thr.ThresholdBytes
@@ -310,5 +392,85 @@ func (p *Poller) applyThresholdsLocked() {
 			tv.OverStreak = 0
 			tv.ConfirmedOver = false
 		}
+		tv.GrowthThreshold = thr.GrowthPerHour
+		if tv.GrowthThreshold == nil || tv.GrowthPerHour < *tv.GrowthThreshold {
+			tv.GrowthStreak = 0
+			tv.GrowthConfirmed = false
+		}
 	}
+}
+
+// growthFromWindow derives the previous sample and the growth rate over the
+// whole window. With only one sample there is no baseline yet.
+func growthFromWindow(win []prevSample) (prevBytes int64, prevAt time.Time, perHour int64) {
+	if len(win) < 2 {
+		return 0, time.Time{}, 0
+	}
+	first, last := win[0], win[len(win)-1]
+	prev := win[len(win)-2]
+	if hours := last.at.Sub(first.at).Hours(); hours > 0 {
+		perHour = int64(float64(last.bytes-first.bytes) / hours)
+	}
+	return prev.bytes, prev.at, perHour
+}
+
+// hoursToLimit forecasts how long the topic can keep growing at its current
+// rate before it crosses its size threshold. Nil when there is no threshold,
+// growth is flat or negative, or the topic is already over.
+func hoursToLimit(threshold *int64, storage, growthPerHour int64) *int64 {
+	if threshold == nil || growthPerHour <= 0 || storage >= *threshold {
+		return nil
+	}
+	h := int64(math.Ceil(float64(*threshold-storage) / float64(growthPerHour)))
+	return &h
+}
+
+// partitionSkew is max/avg over leader partition sizes: a cheap hot-key /
+// bad-partitioner signal. 0 means unknown (fewer than 2 sized partitions).
+func partitionSkew(parts []kafka.PartitionUse) float64 {
+	var total, max int64
+	n := 0
+	for _, pu := range parts {
+		if pu.SizeBytes <= 0 {
+			continue
+		}
+		total += pu.SizeBytes
+		if pu.SizeBytes > max {
+			max = pu.SizeBytes
+		}
+		n++
+	}
+	if n < 2 || total == 0 {
+		return 0
+	}
+	avg := float64(total) / float64(n)
+	return float64(max) / avg
+}
+
+// evaluateSkew finds the hottest broker and reports whether it violates the
+// policy. Share is measured against broker-reported bytes (which include
+// topics filtered out of the UI), not against the visible total.
+func evaluateSkew(brokers []kafka.BrokerUse, pol SkewPolicy) (hotID int32, sharePct float64, over bool) {
+	if len(brokers) == 0 {
+		return -1, 0, false
+	}
+	hot := brokers[0]
+	var total int64
+	for _, b := range brokers {
+		total += b.Bytes
+		if b.Bytes > hot.Bytes {
+			hot = b
+		}
+	}
+	if total <= 0 {
+		return hot.ID, 0, false
+	}
+	sharePct = float64(hot.Bytes) / float64(total) * 100
+	if pol.MaxBytes > 0 && hot.Bytes > pol.MaxBytes {
+		over = true
+	}
+	if len(brokers) >= 2 && pol.SharePct > 0 && sharePct > float64(pol.SharePct) {
+		over = true
+	}
+	return hot.ID, sharePct, over
 }

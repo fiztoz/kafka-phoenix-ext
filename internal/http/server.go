@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -18,7 +19,7 @@ import (
 	"github.com/fiztoz/kafka-phoenix-ext/internal/store"
 )
 
-//go:embed views/dashboard.html views/topic.html views/wallboard.html views/icon.svg
+//go:embed views/styles.html views/dashboard.html views/topic.html views/wallboard.html views/broker.html views/icon.svg
 var assets embed.FS
 
 // SnapshotSource is what the HTTP layer reads from the poller.
@@ -68,9 +69,12 @@ func New(deps Deps) (*Server, error) {
 		"rf":     replicationFactor,
 		"num":    func(p *int64) string { return formatNum(p) },
 		"numv":   func(p *int64) int64 { return numValue(p) },
+		"pskew":  partSkew,
 		"stale":  func(f bool) string { return map[bool]string{true: "stale", false: ""}[f] },
 	}
-	tmpl, err := template.New("").Funcs(funcs).ParseFS(assets, "views/dashboard.html", "views/topic.html", "views/wallboard.html")
+	tmpl, err := template.New("").Funcs(funcs).ParseFS(assets,
+		"views/styles.html", "views/dashboard.html", "views/topic.html",
+		"views/wallboard.html", "views/broker.html")
 	if err != nil {
 		return nil, fmt.Errorf("http: parse templates: %w", err)
 	}
@@ -102,15 +106,20 @@ func (s *Server) register(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc("GET "+p+"/health/ready", s.securityHeaders(s.handleReady))
 	mux.HandleFunc("GET "+p+"/health/thresholds", s.securityHeaders(s.handleThresholdsAll))
 	mux.HandleFunc("GET "+p+"/health/thresholds/{topic}", s.securityHeaders(s.handleThresholdsTopic))
+	mux.HandleFunc("GET "+p+"/health/replicas", s.securityHeaders(s.handleHealthReplicas))
+	mux.HandleFunc("GET "+p+"/health/growth", s.securityHeaders(s.handleHealthGrowth))
+	mux.HandleFunc("GET "+p+"/health/brokers", s.securityHeaders(s.handleHealthBrokers))
 
 	// UI-token-guarded routes (open when UI_TOKEN is empty).
 	mux.HandleFunc("GET "+p+"/", s.securityHeaders(s.uiAuth(s.handleDashboard)))
 	mux.HandleFunc("GET "+p+"/wallboard", s.securityHeaders(s.uiAuth(s.handleWallboard)))
 	mux.HandleFunc("GET "+p+"/topic/{name}", s.securityHeaders(s.uiAuth(s.handleTopicPage)))
+	mux.HandleFunc("GET "+p+"/broker/{id}", s.securityHeaders(s.uiAuth(s.handleBrokerPage)))
 	mux.HandleFunc("POST "+p+"/thresholds", s.securityHeaders(s.uiAuth(s.handleThresholdForm)))
 	mux.HandleFunc("POST "+p+"/thresholds/delete", s.securityHeaders(s.uiAuth(s.handleThresholdDeleteForm)))
 	mux.HandleFunc("GET "+p+"/api/topics", s.securityHeaders(s.uiAuth(s.handleAPITopics)))
 	mux.HandleFunc("GET "+p+"/api/topics/{topic}", s.securityHeaders(s.uiAuth(s.handleAPITopic)))
+	mux.HandleFunc("GET "+p+"/api/brokers", s.securityHeaders(s.uiAuth(s.handleAPIBrokers)))
 	mux.HandleFunc("POST "+p+"/api/thresholds", s.securityHeaders(s.uiAuth(s.handleAPISetThreshold)))
 	mux.HandleFunc("DELETE "+p+"/api/thresholds/{topic}", s.securityHeaders(s.uiAuth(s.handleAPIDeleteThreshold)))
 }
@@ -219,11 +228,65 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
-	msg := "kafka unreachable"
-	if snap.LastError != "" {
-		msg = snap.LastError
+	if snap.LastError == "" {
+		_, _ = w.Write([]byte("no successful poll yet"))
+		return
 	}
-	_, _ = w.Write([]byte(msg))
+	// Classify so an ACL problem is never reported as "kafka unreachable":
+	// the on-call response to each is different.
+	if classifyErr(snap.LastError) == errAuth {
+		_, _ = w.Write([]byte("authenticated but missing ACLs: " + snap.LastError))
+		return
+	}
+	_, _ = w.Write([]byte(snap.LastError))
+}
+
+// handleHealthReplicas is 503 while any topic stays under-replicated or
+// offline across confirmSamples polls. Metadata alone feeds this, so it
+// needs no extra ACLs beyond what the poller already uses.
+func (s *Server) handleHealthReplicas(w http.ResponseWriter, _ *http.Request) {
+	snap := s.deps.Snapshots.Snapshot()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	for _, t := range snap.Topics {
+		if t.ReplicaConfirmed {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, "topic %s has under-replicated or offline partitions for %d consecutive polls",
+				t.Name, t.RepStreak)
+			return
+		}
+	}
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleHealthGrowth is 503 while any topic's rolling growth rate stays at
+// or above its operator-set growth limit across confirmSamples polls.
+func (s *Server) handleHealthGrowth(w http.ResponseWriter, _ *http.Request) {
+	snap := s.deps.Snapshots.Snapshot()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	for _, t := range snap.Topics {
+		if t.GrowthConfirmed {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, "topic %s growing %s/hr over growth limit %s/hr for %d consecutive polls",
+				t.Name, Growth(t.GrowthPerHour), HumanBytes(numValue(t.GrowthThreshold)), t.GrowthStreak)
+			return
+		}
+	}
+	_, _ = w.Write([]byte("ok"))
+}
+
+// handleHealthBrokers is 503 while the hottest broker stays over the skew
+// policy (share of cluster bytes or absolute cap) across confirmSamples
+// polls.
+func (s *Server) handleHealthBrokers(w http.ResponseWriter, _ *http.Request) {
+	snap := s.deps.Snapshots.Snapshot()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if snap.SkewConfirmed {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, "broker %d holds %.1f%% of cluster storage for %d consecutive polls",
+			snap.SkewBrokerID, snap.SkewSharePct, snap.SkewStreak)
+		return
+	}
+	_, _ = w.Write([]byte("ok"))
 }
 
 func (s *Server) handleThresholdsAll(w http.ResponseWriter, _ *http.Request) {
@@ -286,6 +349,14 @@ type apiTopic struct {
 	WarnBytes      *int64 `json:"warn_bytes"`
 	OverStreak     int    `json:"over_streak"`
 	ConfirmedOver  bool   `json:"confirmed_over"`
+
+	GrowthThreshold  *int64  `json:"growth_threshold_bytes_per_hour"`
+	GrowthStreak     int     `json:"growth_over_streak"`
+	GrowthConfirmed  bool    `json:"growth_confirmed"`
+	HoursToLimit     *int64  `json:"hours_to_limit"`
+	PartitionSkew    float64 `json:"partition_skew_max_over_avg"`
+	RepStreak        int     `json:"replica_issue_streak"`
+	ReplicaConfirmed bool    `json:"replica_issue_confirmed"`
 }
 
 type apiPartition struct {
@@ -317,6 +388,25 @@ type apiBroker struct {
 	Host       string `json:"host"`
 	Bytes      int64  `json:"bytes"`
 	Partitions int    `json:"partitions"`
+}
+
+// apiBrokerShare extends apiBroker with its share of broker-reported bytes.
+type apiBrokerShare struct {
+	apiBroker
+	SharePct float64 `json:"share_pct"`
+}
+
+type apiBrokersResponse struct {
+	ClusterID        string           `json:"cluster_id"`
+	PolledAt         time.Time        `json:"polled_at"`
+	PollOK           bool             `json:"poll_ok"`
+	LastError        string           `json:"last_error"`
+	TotalBrokerBytes int64            `json:"total_broker_bytes"`
+	Brokers          []apiBrokerShare `json:"brokers"`
+	SkewConfirmed    bool             `json:"skew_confirmed"`
+	SkewStreak       int              `json:"skew_streak"`
+	SkewBrokerID     int32            `json:"skew_broker_id"`
+	SkewSharePct     float64          `json:"skew_share_pct"`
 }
 
 func (s *Server) handleAPITopics(w http.ResponseWriter, _ *http.Request) {
@@ -391,15 +481,56 @@ func toAPIResponse(s *Server, snap poller.Snapshot, only *poller.TopicView) apiR
 			WarnBytes:      t.WarnBytes,
 			OverStreak:     t.OverStreak,
 			ConfirmedOver:  t.ConfirmedOver,
+
+			GrowthThreshold:  t.GrowthThreshold,
+			GrowthStreak:     t.GrowthStreak,
+			GrowthConfirmed:  t.GrowthConfirmed,
+			HoursToLimit:     t.HoursToLimit,
+			PartitionSkew:    t.PartitionSkew,
+			RepStreak:        t.RepStreak,
+			ReplicaConfirmed: t.ReplicaConfirmed,
 		})
 	}
 	return resp
+}
+
+// handleAPIBrokers serves the per-broker storage view for automation (#12).
+func (s *Server) handleAPIBrokers(w http.ResponseWriter, _ *http.Request) {
+	snap := s.deps.Snapshots.Snapshot()
+	var total int64
+	for _, b := range snap.Brokers {
+		total += b.Bytes
+	}
+	resp := apiBrokersResponse{
+		ClusterID:        snap.ClusterID,
+		PolledAt:         snap.PolledAt.UTC(),
+		PollOK:           snap.PollOK,
+		LastError:        snap.LastError,
+		TotalBrokerBytes: total,
+		Brokers:          make([]apiBrokerShare, 0, len(snap.Brokers)),
+		SkewConfirmed:    snap.SkewConfirmed,
+		SkewStreak:       snap.SkewStreak,
+		SkewBrokerID:     snap.SkewBrokerID,
+		SkewSharePct:     snap.SkewSharePct,
+	}
+	for _, b := range snap.Brokers {
+		share := 0.0
+		if total > 0 {
+			share = float64(b.Bytes) / float64(total) * 100
+		}
+		resp.Brokers = append(resp.Brokers, apiBrokerShare{
+			apiBroker: apiBroker{ID: b.ID, Host: b.Host, Bytes: b.Bytes, Partitions: b.Partitions},
+			SharePct:  math.Round(share*10) / 10,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type thresholdRequest struct {
 	Topic          string `json:"topic"`
 	ThresholdBytes int64  `json:"threshold_bytes"`
 	WarnBytes      *int64 `json:"warn_bytes"`
+	GrowthPerHour  *int64 `json:"growth_bytes_per_hour"`
 }
 
 func (s *Server) handleAPISetThreshold(w http.ResponseWriter, r *http.Request) {
@@ -418,9 +549,10 @@ func (s *Server) handleAPISetThreshold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"topic":           body.Topic,
-		"threshold_bytes": body.ThresholdBytes,
-		"warn_bytes":      body.WarnBytes,
+		"topic":                 body.Topic,
+		"threshold_bytes":       body.ThresholdBytes,
+		"warn_bytes":            body.WarnBytes,
+		"growth_bytes_per_hour": body.GrowthPerHour,
 	})
 }
 
@@ -447,6 +579,9 @@ func (s *Server) setThreshold(r *http.Request, q thresholdRequest) error {
 	if q.WarnBytes != nil && (*q.WarnBytes <= 0 || *q.WarnBytes >= q.ThresholdBytes) {
 		return fmt.Errorf("warn_bytes must be positive and below threshold_bytes")
 	}
+	if q.GrowthPerHour != nil && *q.GrowthPerHour <= 0 {
+		return fmt.Errorf("growth_bytes_per_hour must be a positive integer")
+	}
 	snap := s.deps.Snapshots.Snapshot()
 	known := false
 	for _, t := range snap.Topics {
@@ -460,7 +595,7 @@ func (s *Server) setThreshold(r *http.Request, q thresholdRequest) error {
 		// can carry a threshold.
 		return errUnknownTopic
 	}
-	if err := s.deps.Store.SetThreshold(r.Context(), q.Topic, q.ThresholdBytes, q.WarnBytes); err != nil {
+	if err := s.deps.Store.SetThreshold(r.Context(), q.Topic, q.ThresholdBytes, q.WarnBytes, q.GrowthPerHour); err != nil {
 		s.deps.Log.Error("set threshold failed", "err", err)
 		return fmt.Errorf("store error")
 	}
@@ -490,7 +625,7 @@ func joinInts(a []int32) string {
 // replicationFactor renders average RF with one decimal for templates.
 func replicationFactor(replicas, partitions int) string {
 	if partitions <= 0 {
-		return "—"
+		return "-"
 	}
 	return fmt.Sprintf("%.1f", float64(replicas)/float64(partitions))
 }

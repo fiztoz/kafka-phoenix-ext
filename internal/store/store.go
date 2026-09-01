@@ -23,12 +23,14 @@ type StateRow struct {
 	LastError     string
 }
 
-// ThresholdRow is one operator-set size threshold. WarnBytes is optional
-// and must be below ThresholdBytes.
+// ThresholdRow is one operator-set threshold bundle. WarnBytes is optional
+// and must be below ThresholdBytes; GrowthPerHour is an optional bytes/hour
+// growth limit evaluated against the poller's rolling growth window.
 type ThresholdRow struct {
 	Topic          string
 	ThresholdBytes int64
 	WarnBytes      *int64
+	GrowthPerHour  *int64
 	UpdatedAt      time.Time
 }
 
@@ -40,8 +42,9 @@ type Store interface {
 	// States returns all durable state rows (used to seed hysteresis and
 	// growth history after a restart).
 	States(ctx context.Context) ([]StateRow, error)
-	// SetThreshold inserts or replaces a topic size threshold.
-	SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes *int64) error
+	// SetThreshold inserts or replaces a topic threshold bundle. warnBytes
+	// and growthPerHour are optional (nil clears them).
+	SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error
 	// DeleteThreshold removes a threshold row. Missing rows are not an error.
 	DeleteThreshold(ctx context.Context, topic string) error
 	// Thresholds returns all thresholds keyed by topic.

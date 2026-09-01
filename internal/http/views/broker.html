@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broker {{.Broker.ID}} - Kafka Storage</title>
+{{template "styles" .}}
+</head>
+<body>
+<div class="wrap">
+<header class="topbar">
+  <div class="brand">
+    <h1>Broker {{.Broker.ID}}</h1>
+    <div class="sub">
+      {{if .Broker.Host}}<span>host <b>{{.Broker.Host}}</b></span>{{end}}
+      {{if .ClusterID}}<span>cluster <b>{{.ClusterID}}</b></span>{{end}}
+      <span>polled {{age .PolledAt}} ago</span>
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{{.BasePath}}/">All topics</a>
+    <a class="btn" href="{{.BasePath}}/wallboard">Wallboard</a>
+  </div>
+</header>
+
+<div class="cards">
+  <div class="card"><div class="k">Storage on broker</div><div class="v accent">{{bytes .Broker.Bytes}}</div><div class="d">all copies in its log dirs</div></div>
+  <div class="card"><div class="k">Share of cluster</div><div class="v">{{.Share}}</div><div class="d">of broker-reported bytes</div></div>
+  <div class="card"><div class="k">Replica copies</div><div class="v">{{.Broker.Partitions}}</div></div>
+  <div class="card"><div class="k">Leader partitions</div><div class="v">{{.LeaderParts}}</div><div class="d">{{bytes .LeaderBytes}} led here</div></div>
+</div>
+
+<section class="panel">
+  <h2 class="panel-h">Topics hosted on this broker</h2>
+  <div class="table-wrap" style="border:0">
+  <table>
+  <thead>
+  <tr>
+    <th>Topic</th>
+    <th class="num">Copies</th>
+    <th class="num">Led partitions</th>
+    <th class="num">Leader bytes</th>
+  </tr>
+  </thead>
+  <tbody>
+  {{range .Hosted}}
+  <tr>
+    <td><a class="mono" href="{{$.BasePath}}/topic/{{.Name}}">{{.Name}}</a></td>
+    <td class="num">{{.Copies}}</td>
+    <td class="num">{{.LeaderParts}}</td>
+    <td class="num">{{bytes .LeaderBytes}}</td>
+  </tr>
+  {{else}}
+  <tr><td colspan="4"><div class="empty">No topic copies reported on this broker.</div></td></tr>
+  {{end}}
+  </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="panel">
+  <h2 class="panel-h">Largest partitions led here</h2>
+  <div class="table-wrap" style="border:0">
+  <table>
+  <thead>
+  <tr>
+    <th>Topic</th>
+    <th class="num">Partition</th>
+    <th class="num">Size</th>
+  </tr>
+  </thead>
+  <tbody>
+  {{range .Leaders}}
+  <tr>
+    <td><a class="mono" href="{{$.BasePath}}/topic/{{.Topic}}">{{.Topic}}</a></td>
+    <td class="num">{{.Partition}}</td>
+    <td class="num">{{bytes .SizeBytes}}</td>
+  </tr>
+  {{else}}
+  <tr><td colspan="3"><div class="empty">This broker leads no partitions with reported sizes.</div></td></tr>
+  {{end}}
+  </tbody>
+  </table>
+  </div>
+  {{if .LeaderTruncated}}<p class="form-note">Showing the 25 largest leader partitions.</p>{{end}}
+</section>
+
+<footer class="foot">
+  Derived from the same DescribeLogDirs + Metadata sample as the dashboard. Non-leader copies
+  are counted but their sizes are only known to the broker that reports them, so "leader bytes"
+  is the comparable column.
+</footer>
+</div>
+</body>
+</html>

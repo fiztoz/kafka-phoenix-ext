@@ -4,188 +4,163 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kafka Storage</title>
-<style>
-:root {
-  color-scheme: light dark;
-  --bg: #f6f7f9;
-  --card: #ffffff;
-  --text: #1c2430;
-  --muted: #5b6b7c;
-  --line: #e3e8ee;
-  --accent: #d75a4a;
-  --ok: #2e9e5b;
-  --warn: #b7791f;
-  --bad: #c0392b;
-  --bar: #f0e4e2;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #10151d;
-    --card: #181f2a;
-    --text: #e8edf3;
-    --muted: #93a1b0;
-    --line: #28313e;
-    --bar: #33262a;
-  }
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: var(--bg);
-  color: var(--text);
-}
-.wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 48px; }
-header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
-.sub { color: var(--muted); font-size: 13px; }
-.pill {
-  display: inline-block; padding: 2px 10px; border-radius: 999px;
-  font-size: 12px; font-weight: 600;
-}
-.pill.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
-.pill.bad { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
-.banner {
-  margin: 14px 0; padding: 10px 14px; border-radius: 8px;
-  background: color-mix(in srgb, var(--bad) 12%, transparent);
-  color: var(--bad); font-size: 13px;
-}
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 16px 0; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
-.card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
-.card .v { font-size: 20px; font-weight: 650; margin-top: 2px; }
-.card .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
-.brokers { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
-.broker {
-  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 12px; font-size: 12px;
-}
-.broker b { font-size: 14px; }
-table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
-th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; background: color-mix(in srgb, var(--card) 70%, var(--bg)); }
-tr:last-child td { border-bottom: 0; }
-td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-a { color: var(--accent); text-decoration: none; font-weight: 600; }
-a:hover { text-decoration: underline; }
-.bar-outer { background: var(--bar); border-radius: 4px; height: 6px; width: 90px; display: inline-block; vertical-align: middle; margin-right: 6px; }
-.bar-inner { background: var(--accent); border-radius: 4px; height: 6px; }
-.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; }
-.badge.warn { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
-.badge.bad { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
-.badge.stale { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
-form.inline { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-form.inline input[type=text], form.inline input[type=number] {
-  width: 96px; padding: 4px 6px; font: 12px/1.4 ui-monospace, monospace;
-  border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text);
-}
-button {
-  font: 12px/1.4 -apple-system, sans-serif; padding: 4px 10px; border-radius: 6px;
-  border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer;
-}
-button:hover { border-color: var(--accent); color: var(--accent); }
-button.del:hover { border-color: var(--bad); color: var(--bad); }
-.thr { font-size: 12px; }
-.thr .set { font-variant-numeric: tabular-nums; }
-footer { margin-top: 18px; color: var(--muted); font-size: 12px; }
-</style>
+{{template "styles" .}}
 </head>
 <body>
 <div class="wrap">
-<header>
-  <h1>Kafka Storage</h1>
-  <span class="sub">{{if .ClusterID}}cluster <b>{{.ClusterID}}</b>{{else}}cluster —{{end}}</span>
-  <span class="sub">brokers {{len .Brokers}}</span>
-  <span class="sub">topics {{len .Topics}}</span>
-  <span class="sub">controller {{.ControllerID}}</span>
-  {{if .PollOK}}<span class="pill ok">polling ok</span>{{else}}<span class="pill bad">poll failed</span>{{end}}
+<header class="topbar">
+  <div class="brand">
+    <h1>Kafka Storage</h1>
+    <div class="sub">
+      {{if .ClusterID}}<span>cluster <b>{{.ClusterID}}</b></span>{{end}}
+      <span>{{len .Brokers}} brokers</span>
+      <span>{{len .Topics}} topics</span>
+      <span>controller {{.ControllerID}}</span>
+      {{if .PollOK}}<span class="pill ok">polling ok</span>{{else}}<span class="pill bad">poll failed</span>{{end}}
+    </div>
+  </div>
+  <div class="actions">
+    <div class="search">
+      <label class="sr-only" for="filter">Filter topics</label>
+      <input type="search" id="filter" placeholder="Filter topics (press /)" autocomplete="off" spellcheck="false">
+      <span class="count" id="filter-count" role="status"></span>
+    </div>
+    <a class="btn btn-solid" href="{{.BasePath}}/wallboard">Wallboard</a>
+  </div>
 </header>
 
 {{if not .PollOK}}
-<div class="banner">Last poll failed{{if .LastError}}: {{.LastError}}{{end}}. Showing the last good sample.</div>
+<div class="banner bad">
+  {{if eq .ErrKind "auth"}}Kafka authenticated, but this principal is missing permissions.
+  {{else if eq .ErrKind "timeout"}}The Kafka poll timed out.
+  {{else}}Kafka is unreachable.{{end}}
+  Showing the last good sample.
+  {{if .ErrHint}}<span class="hint">{{.ErrHint}}</span>{{end}}
+  {{if .LastError}}<span class="hint">Last error: {{.LastError}}</span>{{end}}
+</div>
+{{end}}
+{{if .SkewConfirmed}}
+<div class="banner warn">Broker {{.SkewHotID}} holds {{.SkewShare}} of cluster storage. Disk skew confirmed across consecutive polls.</div>
 {{end}}
 
 <div class="cards">
-  <div class="card"><div class="k">Total on disk</div><div class="v">{{bytes .TotalBytes}}</div></div>
-  <div class="card"><div class="k">Brokers</div><div class="v">{{len .Brokers}}</div></div>
-  <div class="card"><div class="k">Topics</div><div class="v">{{len .Topics}}</div></div>
-  <div class="card"><div class="k">Polled</div><div class="v"><small>{{ts .PolledAt}} ({{age .PolledAt}})</small></div></div>
+  <div class="card"><div class="k">Total on disk</div><div class="v accent">{{bytes .TotalBytes}}</div><div class="d">all replica copies</div></div>
+  <div class="card"><div class="k">Brokers</div><div class="v">{{len .Brokers}}</div><div class="d">{{bytes .TotalBrokerBytes}} reported</div></div>
+  <div class="card"><div class="k">Topics</div><div class="v">{{len .Topics}}</div><div class="d">after topic filter</div></div>
+  <div class="card"><div class="k">Polled</div><div class="v">{{age .PolledAt}}<small> ago</small></div><div class="d">{{ts .PolledAt}}</div></div>
 </div>
 
-<div class="brokers">
+<div class="chips">
 {{range .Brokers}}
-  <div class="broker"><b>{{bytes .Bytes}}</b> broker {{.ID}}{{if .Host}} · {{.Host}}{{end}} · {{.Partitions}} copies</div>
+  <a class="chip{{if and (eq $.SkewHotID .ID) $.SkewConfirmed}} hot{{end}}" href="{{$.BasePath}}/broker/{{.ID}}">
+    <b>{{bytes .Bytes}}</b>
+    <span>broker {{.ID}}{{if .Host}} ({{.Host}}){{end}}, {{.Partitions}} copies</span>
+  </a>
 {{else}}
-  <div class="broker">no broker data yet</div>
+  <div class="chip"><span>no broker data yet</span></div>
 {{end}}
 </div>
 
+<div class="table-wrap">
 <table>
 <thead>
 <tr>
-  <th>Topic</th>
-  <th class="num">Size</th>
-  <th class="num">Share</th>
-  <th class="num">Data</th>
-  <th class="num">Growth</th>
-  <th class="num">Part./RF</th>
+  <th><a class="sortlink{{if eq .Sort "name"}} active{{end}}" href="?sort=name">Topic</a></th>
+  <th class="num"><a class="sortlink{{if eq .Sort "size"}} active{{end}}" href="?sort=size">Size</a></th>
+  <th class="num col-optional">Data</th>
+  <th class="num"><a class="sortlink{{if eq .Sort "growth"}} active{{end}}" href="?sort=growth">Growth</a></th>
+  <th class="num"><a class="sortlink{{if eq .Sort "skew"}} active{{end}}" href="?sort=skew" title="Largest partition vs average partition">P. skew</a></th>
+  <th class="num col-optional">Part / RF</th>
   <th>Health</th>
-  <th>Threshold</th>
+  <th class="num">Limit</th>
 </tr>
 </thead>
 <tbody>
+{{if .Topics}}<tr id="filter-empty" hidden><td colspan="8"><div class="empty">No topics match the filter.</div></td></tr>{{end}}
 {{range .Topics}}
-<tr>
+<tr data-name="{{.Name}}">
   <td>
-    <a href="{{$.BasePath}}/topic/{{.Name}}">{{.Name}}</a>
-    {{if .IsInternal}}<span class="badge stale">internal</span>{{end}}
-    {{if .Stale}}<span class="badge stale">stale</span>{{end}}
+    <a class="mono" href="{{$.BasePath}}/topic/{{.Name}}">{{.Name}}</a>
+    {{if .IsInternal}}<span class="badge neutral">internal</span>{{end}}
+    {{if .Stale}}<span class="badge neutral">stale</span>{{end}}
   </td>
-  <td class="num">{{bytes .StorageBytes}}</td>
-  <td class="num"><span class="bar-outer"><span class="bar-inner" style="width: {{pct .StorageBytes $.TotalBytes}}"></span></span>{{pct .StorageBytes $.TotalBytes}}</td>
-  <td class="num">{{bytes .LeaderBytes}}</td>
-  <td class="num">{{growth .GrowthPerHour}}</td>
-  <td class="num">{{.Partitions}} / {{rf .Replicas .Partitions}}</td>
+  <td class="num">
+    <span class="share"><span class="bar-outer"><span class="bar-inner" style="width:{{pct .StorageBytes $.TotalBytes}}"></span></span>{{bytes .StorageBytes}}</span>
+    <span class="cellsub">{{pct .StorageBytes $.TotalBytes}} of cluster</span>
+  </td>
+  <td class="num col-optional">{{bytes .LeaderBytes}}</td>
+  <td class="num">
+    {{growth .GrowthPerHour}}
+    {{if .HoursToLimit}}<span class="cellsub">~{{numv .HoursToLimit}}h to limit</span>{{end}}
+  </td>
+  <td class="num">{{pskew .PartitionSkew}}</td>
+  <td class="num col-optional">{{.Partitions}} / {{rf .Replicas .Partitions}}</td>
   <td>
     {{if .UnderRep}}<span class="badge bad">{{.UnderRep}} under-rep</span>{{end}}
     {{if .Offline}}<span class="badge bad">{{.Offline}} offline</span>{{end}}
-    {{if and (not .UnderRep) (not .Offline)}}<span style="color:var(--ok)">ok</span>{{end}}
+    {{if .ReplicaConfirmed}}<span class="badge bad">confirmed</span>{{end}}
+    {{if and (not .UnderRep) (not .Offline)}}<span class="badge ok">ok</span>{{end}}
   </td>
-  <td class="thr">
+  <td class="num">
     {{if .ThresholdBytes}}
-      {{if .ConfirmedOver}}<span class="badge bad">over ({{.OverStreak}}×)</span>
-      {{else if ge .StorageBytes .ThresholdBytes}}<span class="badge bad">over</span>
+      {{if .ConfirmedOver}}<span class="badge bad">over ({{.OverStreak}}x)</span>
+      {{else if ge .StorageBytes (numv .ThresholdBytes)}}<span class="badge bad">over</span>
       {{else if .WarnBytes}}
-        {{if ge .StorageBytes .WarnBytes}}<span class="badge warn">warn</span>{{else}}<span class="badge" style="color:var(--ok)">under</span>{{end}}
-      {{else}}<span class="badge" style="color:var(--ok)">under</span>{{end}}
-      <span class="set">limit {{bytes .ThresholdBytes}}{{if .WarnBytes}} · warn {{bytes (numv .WarnBytes)}}{{end}}</span>
-    {{else}}
-      —
-    {{end}}
-    <form class="inline" method="post" action="{{$.BasePath}}/thresholds" style="margin-top:4px">
-      <input type="hidden" name="topic" value="{{.Name}}">
-      <input type="number" name="warn_bytes" min="1" placeholder="warn B" value="{{num .WarnBytes}}">
-      <input type="number" name="threshold_bytes" min="1" placeholder="limit B" value="{{num .ThresholdBytes}}" required>
-      <button type="submit">save</button>
-      {{if .ThresholdBytes}}<button class="del" type="submit" formaction="{{$.BasePath}}/thresholds/delete" formmethod="post">✕</button>{{end}}
-    </form>
+        {{if ge .StorageBytes (numv .WarnBytes)}}<span class="badge warn">warn</span>{{else}}<span class="badge ok">under</span>{{end}}
+      {{else}}<span class="badge ok">under</span>{{end}}
+      <span class="cellsub">limit {{bytes (numv .ThresholdBytes)}}</span>
+    {{else}}<span class="cellsub">none</span>{{end}}
   </td>
 </tr>
 {{else}}
-<tr><td colspan="8" style="color:var(--muted)">No topics yet — waiting for the first successful poll.</td></tr>
+<tr><td colspan="8"><div class="empty">No topics yet. Waiting for the first successful poll.</div></td></tr>
 {{end}}
 </tbody>
 </table>
+</div>
 
 {{range .BrokerErrors}}
-<div class="banner" style="margin-top:10px">Partial data: {{.}}</div>
+<div class="banner warn">Partial data: {{.}}</div>
 {{end}}
 
-<footer>
-  Storage = all replica copies as reported by DescribeLogDirs (cluster-wide disk footprint).
-  Data = leader copies only (logical size). Values update every poll.
-  <a href="{{.BasePath}}/wallboard">Wallboard</a>
+<footer class="foot">
+  Storage counts every replica copy reported by DescribeLogDirs (cluster-wide disk footprint).
+  Data counts leader copies only (logical size). Growth and time-to-limit use a rolling window
+  of recent polls. Thresholds edit on each topic page.
 </footer>
 </div>
+
+<script>
+(function () {
+  var input = document.getElementById("filter");
+  if (!input) return;
+  var items = Array.prototype.slice.call(document.querySelectorAll("[data-name]"));
+  var count = document.getElementById("filter-count");
+  var empty = document.getElementById("filter-empty");
+  function apply() {
+    var q = input.value.trim().toLowerCase();
+    var shown = 0;
+    for (var i = 0; i < items.length; i++) {
+      var hit = q === "" || items[i].getAttribute("data-name").toLowerCase().indexOf(q) !== -1;
+      items[i].hidden = !hit;
+      if (hit) shown++;
+    }
+    if (count) count.textContent = q === "" ? items.length + " topics" : shown + " of " + items.length;
+    if (empty) empty.hidden = shown !== 0;
+  }
+  input.addEventListener("input", apply);
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { input.value = ""; apply(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    var tag = document.activeElement ? document.activeElement.tagName : "";
+    if (e.key === "/" && tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") {
+      e.preventDefault();
+      input.focus();
+    }
+  });
+  apply();
+})();
+</script>
 </body>
 </html>

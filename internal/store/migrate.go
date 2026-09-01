@@ -35,6 +35,7 @@ func Migrate(ctx context.Context, db *sql.DB, migrations fs.FS) error {
 	}
 	all := []migration{
 		{1, "migrations/001_init.up.sql"},
+		{2, "migrations/002_growth_threshold.up.sql"},
 	}
 	for _, m := range all {
 		if current >= m.version {
