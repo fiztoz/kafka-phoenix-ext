@@ -14,7 +14,7 @@
     <div class="sub">
       {{if .ClusterID}}<span>cluster <b>{{.ClusterID}}</b></span>{{end}}
       <span>{{len .Brokers}} brokers</span>
-      <span>{{len .Topics}} topics</span>
+      <span id="filter-count" role="status">{{len .Topics}} topics</span>
       <span>controller {{.ControllerID}}</span>
       {{if .PollOK}}<span class="pill ok">polling ok</span>{{else}}<span class="pill bad">poll failed</span>{{end}}
     </div>
@@ -23,7 +23,6 @@
     <div class="search">
       <label class="sr-only" for="filter">Filter topics</label>
       <input type="search" id="filter" placeholder="Filter topics (press /)" autocomplete="off" spellcheck="false">
-      <span class="count" id="filter-count" role="status"></span>
     </div>
     <a class="btn btn-solid" href="{{.BasePath}}/wallboard">Wallboard</a>
   </div>
