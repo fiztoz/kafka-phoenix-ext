@@ -19,9 +19,42 @@
   --btn-bg:#e0715c; --btn-fg:#1c1210;
   --ok:#4cc284; --warn:#d29a3a; --bad:#e0604c;
 }
-.wallboard .brand h1 { font-size:24px; }
-.wallboard .card .v { font-size:22px; }
-.wallboard .card .v.accent { font-size:clamp(24px, 3vw, 30px); }
+/* --- large-screen fill ---
+   The shared .wrap caps every page at a 1160px reading column. That is right for
+   the dashboard's tables and wrong here: measured at 2560px the wallboard used
+   1160px of it (700px dead) and held three tile columns at every size from 1280
+   to 5120, with 28px numbers on a panel meant to be read from across a room. So
+   this page owns its viewport. The type/padding clamps below are pinned to the
+   pixel values this page already used, so a laptop or the Phoenix iframe looks
+   unchanged; what actually grows is the tile column floor (17vw, capped at 440px),
+   which buys more columns on a wide screen, and the type follows once the floor
+   hits its cap. */
+.wallboard .wrap { max-width:none; padding:clamp(22px, 1.9vw, 48px) clamp(14px, 2.4vw, 64px) 48px; }
+.wallboard .grid { grid-template-columns:repeat(auto-fill, minmax(clamp(280px, 17vw, 440px), 1fr)); gap:clamp(12px, 1.1vw, 22px); }
+
+/* Summary band stays four proportional panels, as it is today at 1160px. */
+.wallboard .cards { grid-template-columns:repeat(auto-fit, minmax(clamp(150px, 22vw, 480px), 1fr)); gap:clamp(10px, .9vw, 18px); }
+.wallboard .card { padding:clamp(12px, 1.1vw, 24px) clamp(14px, 1.2vw, 28px); }
+.wallboard .card .k { font-size:clamp(11px, .78vw, 16px); }
+.wallboard .card .v { font-size:clamp(22px, 1.7vw, 36px); }
+.wallboard .card .v.accent { font-size:clamp(24px, 2.2vw, 46px); }
+
+.wallboard .brand h1 { font-size:clamp(24px, 1.5vw, 38px); }
+.wallboard .sub { font-size:clamp(13px, .9vw, 18px); }
+
+/* Tiles scale with their own column, so long topic names stay a readable
+   measure instead of one giant headline stretching the full wall. */
+.wallboard .tile { padding:clamp(14px, 1.2vw, 28px) clamp(16px, 1.3vw, 30px); display:flex; flex-direction:column; }
+.wallboard .tile h2 { font-size:clamp(14px, 1.05vw, 21px); }
+.wallboard .tile .size { font-size:clamp(28px, 2.2vw, 48px); flex:1; }
+.wallboard .tile .bar { height:clamp(7px, .5vw, 11px); }
+.wallboard .tile .fill { height:clamp(7px, .5vw, 11px); }
+.wallboard .tile .dets { font-size:clamp(12px, .85vw, 16px); gap:6px clamp(14px, 1.2vw, 22px); }
+
+.wallboard .chip { min-width:clamp(138px, 11vw, 240px); padding:clamp(8px, .8vw, 16px) clamp(12px, 1vw, 22px); }
+.wallboard .chip b { font-size:clamp(15px, 1.1vw, 24px); }
+.wallboard .chip span { font-size:clamp(11.5px, .8vw, 16px); }
+.wallboard .foot { font-size:clamp(12px, .8vw, 16px); }
 </style>
 </head>
 <body class="wallboard">
