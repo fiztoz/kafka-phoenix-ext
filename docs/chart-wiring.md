@@ -11,7 +11,7 @@ extensions:
   - id: kafka-usage          # DNS-1123 label; rendered as <release>-ext-kafka-usage
     title: Kafka             # sidebar label
     path: /kafka
-    image: ghcr.io/fiztoz/kafka-phoenix-ext:0.1.0
+    image: ghcr.io/fiztoz/kafka-phoenix-ext:0.2.3
     port: 8080               # override! chart default 80; non-root image binds 8080
     readinessPath: /health/live
     database:
