@@ -71,6 +71,7 @@ func New(deps Deps) (*Server, error) {
 		"numv":   func(p *int64) int64 { return numValue(p) },
 		"pskew":  partSkew,
 		"stale":  func(f bool) string { return map[bool]string{true: "stale", false: ""}[f] },
+		"path":   JoinPath,
 	}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(assets,
 		"views/styles.html", "views/dashboard.html", "views/topic.html",
@@ -255,7 +256,21 @@ func (s *Server) handleHealthReplicas(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
+	if snap.MetadataUnavailable || replicaObservationUnavailable(snap) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("replica metadata unavailable"))
+		return
+	}
 	_, _ = w.Write([]byte("ok"))
+}
+
+func replicaObservationUnavailable(snap poller.Snapshot) bool {
+	for _, t := range snap.Topics {
+		if t.ReplicaUnavailable {
+			return true
+		}
+	}
+	return false
 }
 
 // handleHealthGrowth is 503 while any topic's rolling growth rate stays at
@@ -371,16 +386,19 @@ type apiPartition struct {
 }
 
 type apiResponse struct {
-	ClusterID         string      `json:"cluster_id"`
-	ControllerID      int32       `json:"controller_id"`
-	PolledAt          time.Time   `json:"polled_at"`
-	PollOK            bool        `json:"poll_ok"`
-	LastError         string      `json:"last_error"`
-	TotalBytes        int64       `json:"total_bytes"`
-	StaleAfterSeconds int64       `json:"stale_after_seconds"`
-	Brokers           []apiBroker `json:"brokers"`
-	BrokerErrors      []string    `json:"broker_errors"`
-	Topics            []apiTopic  `json:"topics"`
+	ClusterID           string      `json:"cluster_id"`
+	ControllerID        int32       `json:"controller_id"`
+	PolledAt            time.Time   `json:"polled_at"`
+	PollOK              bool        `json:"poll_ok"`
+	LastError           string      `json:"last_error"`
+	StorageError        string      `json:"storage_error"`
+	SizeIncomplete      bool        `json:"size_incomplete"`
+	MetadataUnavailable bool        `json:"metadata_unavailable"`
+	TotalBytes          int64       `json:"total_bytes"`
+	StaleAfterSeconds   int64       `json:"stale_after_seconds"`
+	Brokers             []apiBroker `json:"brokers"`
+	BrokerErrors        []string    `json:"broker_errors"`
+	Topics              []apiTopic  `json:"topics"`
 }
 
 type apiBroker struct {
@@ -446,16 +464,19 @@ func (s *Server) handleAPITopic(w http.ResponseWriter, r *http.Request) {
 
 func toAPIResponse(s *Server, snap poller.Snapshot, only *poller.TopicView) apiResponse {
 	resp := apiResponse{
-		ClusterID:         snap.ClusterID,
-		ControllerID:      snap.ControllerID,
-		PolledAt:          snap.PolledAt.UTC(),
-		PollOK:            snap.PollOK,
-		LastError:         snap.LastError,
-		TotalBytes:        snap.TotalBytes,
-		StaleAfterSeconds: int64(s.deps.Snapshots.StaleThreshold().Seconds()),
-		Brokers:           make([]apiBroker, 0, len(snap.Brokers)),
-		BrokerErrors:      snap.BrokerErrors,
-		Topics:            make([]apiTopic, 0, len(snap.Topics)),
+		ClusterID:           snap.ClusterID,
+		ControllerID:        snap.ControllerID,
+		PolledAt:            snap.PolledAt.UTC(),
+		PollOK:              snap.PollOK,
+		LastError:           snap.LastError,
+		StorageError:        snap.StorageError,
+		SizeIncomplete:      snap.SizeIncomplete,
+		MetadataUnavailable: snap.MetadataUnavailable,
+		TotalBytes:          snap.TotalBytes,
+		StaleAfterSeconds:   int64(s.deps.Snapshots.StaleThreshold().Seconds()),
+		Brokers:             make([]apiBroker, 0, len(snap.Brokers)),
+		BrokerErrors:        snap.BrokerErrors,
+		Topics:              make([]apiTopic, 0, len(snap.Topics)),
 	}
 	for _, b := range snap.Brokers {
 		resp.Brokers = append(resp.Brokers, apiBroker{

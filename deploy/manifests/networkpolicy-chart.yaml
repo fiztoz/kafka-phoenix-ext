@@ -1,0 +1,40 @@
+# Additive egress for a Phoenix chart install with networkPolicy.enabled.
+# Phoenix already allows DNS and TCP 3306. This policy only opens Kafka
+# broker ports. It must select the pods the chart actually labels.
+#
+# Rendered by phoenix.extensionSelectorLabels for extensions[].id kafka-usage
+# and the default chart name (no nameOverride):
+#   app.kubernetes.io/name: uptime-phoenix-ext
+#   app.kubernetes.io/instance: <helm release name>
+#   app.kubernetes.io/component: extension-kafka-usage
+#
+# The instance below matches `helm install phoenix` / `helm template phoenix`.
+# Replace it with your release name. If nameOverride is set, change
+# app.kubernetes.io/name to <nameOverride>-ext. Do not use
+# app.kubernetes.io/name: kafka-phoenix-ext here; that label is only on the
+# standalone Deployment and matches zero chart pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-phoenix-ext-chart-brokers
+  namespace: phoenix
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: uptime-phoenix-ext
+      app.kubernetes.io/instance: phoenix
+      app.kubernetes.io/component: extension-kafka-usage
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster Kafka across namespaces. External brokers need an ipBlock
+    # for that host, not 0.0.0.0/0.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093
+        - protocol: TCP
+          port: 9094

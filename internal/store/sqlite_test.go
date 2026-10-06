@@ -132,4 +132,56 @@ func TestSQLiteMigrateIsIdempotent(t *testing.T) {
 			t.Fatalf("migrate run %d: %v", i, err)
 		}
 	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(version) FROM ext_kafka_usage_schema_migrations`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Fatalf("schema version = %d, want 3", version)
+	}
+}
+
+func TestSQLiteCaseDistinctTopics(t *testing.T) {
+	ctx := context.Background()
+	s := openTestSQLite(t)
+	now := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
+	if err := s.UpsertStates(ctx, []StateRow{
+		{Topic: "Orders", Partitions: 1, StorageBytes: 10, PolledAt: now},
+		{Topic: "orders", Partitions: 1, StorageBytes: 20, PolledAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetThreshold(ctx, "Orders", 100, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetThreshold(ctx, "orders", 200, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	states, err := s.States(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 2 {
+		t.Fatalf("states = %d, want 2 distinct spellings", len(states))
+	}
+	th, err := s.Thresholds(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if th["Orders"].ThresholdBytes != 100 || th["orders"].ThresholdBytes != 200 {
+		t.Fatalf("thresholds collided: %+v", th)
+	}
+	if err := s.DeleteThreshold(ctx, "Orders"); err != nil {
+		t.Fatal(err)
+	}
+	th, err = s.Thresholds(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := th["Orders"]; ok {
+		t.Fatal("deleted Orders still present")
+	}
+	if th["orders"].ThresholdBytes != 200 {
+		t.Fatalf("orders threshold lost: %+v", th["orders"])
+	}
 }

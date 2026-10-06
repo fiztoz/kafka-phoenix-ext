@@ -1,14 +1,15 @@
-# Optional: required ONLY when the Phoenix chart renders its extension
-# NetworkPolicy (networkPolicy.enabled: true). That template allows egress
-# 80/443/4443/3306 + DNS but not Kafka broker ports; NetworkPolicies are
-# additive, so this union policy opens 9092-9094 for the extension pod
-# without weakening Phoenix's own policy. Match the selectors the chart
-# renders for extensions[].id == "kafka-usage" (release name assumed kafka
-# stack), or run standalone beneath the manifests in this directory.
+# Standalone extension egress. This selects the Deployment in this directory
+# (app.kubernetes.io/name: kafka-phoenix-ext). It does not select chart-managed
+# pods. For a Phoenix chart install with networkPolicy.enabled, apply
+# networkpolicy-chart.yaml instead and set the release instance label.
+#
+# DNS is port 53 only. Destinations are unrestricted for that port because
+# cluster DNS VIPs differ; do not widen this to other ports. There is no
+# 0.0.0.0/0 rule.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: kafka-phoenix-ext-brokers
+  name: kafka-phoenix-ext-egress
   namespace: phoenix
 spec:
   podSelector:
@@ -17,7 +18,14 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Kafka brokers: plaintext (9092), TLS (9093), SASL_SSL (9094).
+    # In-cluster Kafka. External brokers need an ipBlock for that host, not
+    # 0.0.0.0/0. Example:
+    # - to:
+    #     - ipBlock:
+    #         cidr: 203.0.113.20/32
+    #   ports:
+    #     - protocol: TCP
+    #       port: 9092
     - to:
         - namespaceSelector: {}
       ports:
@@ -27,11 +35,19 @@ spec:
           port: 9093
         - protocol: TCP
           port: 9094
-    # Phoenix MariaDB (shared phoenix DB) — kept explicit because the
-    # chart's egress covers 3306 to any namespace already; re-stating it
-    # documents the dependency.
+    # In-cluster MariaDB in this namespace. Matches Phoenix chart MariaDB
+    # pods without pinning the release name. Port 3306 is the documented
+    # default. External MariaDB: delete this rule and use only the database
+    # host, for example 203.0.113.10/32 port 3306. Do not use 0.0.0.0/0.
     - to:
-        - namespaceSelector: {}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: mariadb
       ports:
         - protocol: TCP
           port: 3306
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

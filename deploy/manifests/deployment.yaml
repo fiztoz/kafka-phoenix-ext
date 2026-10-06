@@ -82,9 +82,13 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 30
+          # Serving readiness, not the Kafka dependency monitor. /health/ready
+          # stays available for a Phoenix monitor and returns 503 during a
+          # Kafka outage; using it here would drop the cached dashboard from
+          # the Service.
           readinessProbe:
             httpGet:
-              path: /kafka/health/ready
+              path: /kafka/health/live
               port: http
             initialDelaySeconds: 10
             periodSeconds: 60

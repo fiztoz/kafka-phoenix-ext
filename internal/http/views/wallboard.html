@@ -75,10 +75,13 @@
       <label class="sr-only" for="filter">Filter topics</label>
       <input type="search" id="filter" placeholder="Filter topics (press /)" autocomplete="off" spellcheck="false">
     </div>
-    <a class="btn" href="{{.BasePath}}/">Exit wallboard</a>
+    <a class="btn" href="{{path .BasePath "/"}}">Exit wallboard</a>
   </div>
 </header>
 
+{{if .StorageError}}
+<div class="banner warn">Durability write failed. Alerts still advance in memory. <span class="hint">{{.StorageError}}</span></div>
+{{end}}
 {{if not .PollOK}}
 <div class="banner bad">
   {{if eq .ErrKind "auth"}}Kafka authenticated, but this principal is missing permissions.
@@ -98,7 +101,7 @@
 
 <div class="grid" id="tiles">
 {{range .Topics}}
-<a class="tile{{if or .ConfirmedOver .ReplicaConfirmed}} alert{{else if or .GrowthConfirmed (and .ThresholdBytes .WarnBytes (ge .StorageBytes (numv .WarnBytes)))}} watch{{end}}" data-name="{{.Name}}" href="{{$.BasePath}}/topic/{{.Name}}">
+<a class="tile{{if or .ConfirmedOver .ReplicaConfirmed}} alert{{else if or .GrowthConfirmed (and .ThresholdBytes .WarnBytes (ge .StorageBytes (numv .WarnBytes)))}} watch{{end}}" data-name="{{.Name}}" href="{{path $.BasePath (printf "/topic/%s" .Name)}}">
   <h2>
     {{.Name}}
     {{if .ConfirmedOver}}<span class="badge bad">over limit</span>{{end}}

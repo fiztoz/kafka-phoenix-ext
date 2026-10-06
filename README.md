@@ -96,10 +96,24 @@ inline credential support. See the chart wiring section below.
 
 ## Database
 
-Shares the Phoenix MariaDB (`phoenix` database), its own user and
-`ext_kafka_usage_*` tables. Apply `deploy/grants.sql` after substituting the
-user's password from your vault, then let the extension create its own
-schema on startup (embedded migrations run before the first poll).
+Use a dedicated MariaDB schema `kafka_usage`, not Phoenix's application
+schema. Apply `deploy/grants.sql` after substituting the user's password
+from your vault, then point `DATABASE_DSN` at that schema. The extension
+creates its own tables on startup (embedded migrations run before the first
+poll), including `ext_kafka_usage_schema_migrations`. The schema-level grant
+covers tables added by later migrations, so a new migration does not need a
+GRANT edit. Do not grant `phoenix.*` and do not share Phoenix credentials.
+
+Topic primary keys are case-sensitive (`utf8mb4_bin` on the dedicated
+schema; SQLite's default BINARY collation). Migration 003 converts existing
+MariaDB topic columns. If `Orders` and `orders` already collided under a
+case-insensitive collation, only the stored spelling survives — the lost
+row cannot be reconstructed.
+
+If a dedicated schema is impossible, grant each current extension table
+listed in `deploy/grants.sql` explicitly and repeat that GRANT before
+deploying a migration that creates another table. A table-prefix pattern
+such as `phoenix.ext_kafka_usage_%` is not valid MariaDB syntax.
 
 The store auto-appends `parseTime=true&multiStatements=true` when missing.
 Chart integration (values.yaml example, port override, NetworkPolicy gotcha)

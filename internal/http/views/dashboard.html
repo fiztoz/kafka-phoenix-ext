@@ -24,7 +24,7 @@
       <label class="sr-only" for="filter">Filter topics</label>
       <input type="search" id="filter" placeholder="Filter topics (press /)" autocomplete="off" spellcheck="false">
     </div>
-    <a class="btn btn-solid" href="{{.BasePath}}/wallboard">Wallboard</a>
+    <a class="btn btn-solid" href="{{path .BasePath "/wallboard"}}">Wallboard</a>
   </div>
 </header>
 
@@ -37,6 +37,9 @@
   {{if .ErrHint}}<span class="hint">{{.ErrHint}}</span>{{end}}
   {{if .LastError}}<span class="hint">Last error: {{.LastError}}</span>{{end}}
 </div>
+{{end}}
+{{if .StorageError}}
+<div class="banner warn">Alert state is in memory only; the last durability write failed. <span class="hint">{{.StorageError}}</span></div>
 {{end}}
 {{if .SkewConfirmed}}
 <div class="banner warn">Broker {{.SkewHotID}} holds {{.SkewShare}} of cluster storage. Disk skew confirmed across consecutive polls.</div>
@@ -51,7 +54,7 @@
 
 <div class="chips">
 {{range .Brokers}}
-  <a class="chip{{if and (eq $.SkewHotID .ID) $.SkewConfirmed}} hot{{end}}" href="{{$.BasePath}}/broker/{{.ID}}">
+  <a class="chip{{if and (eq $.SkewHotID .ID) $.SkewConfirmed}} hot{{end}}" href="{{path $.BasePath (printf "/broker/%d" .ID)}}">
     <b>{{bytes .Bytes}}</b>
     <span>broker {{.ID}}{{if .Host}} ({{.Host}}){{end}}, {{.Partitions}} copies</span>
   </a>
@@ -79,7 +82,7 @@
 {{range .Topics}}
 <tr data-name="{{.Name}}">
   <td>
-    <a class="mono" href="{{$.BasePath}}/topic/{{.Name}}">{{.Name}}</a>
+    <a class="mono" href="{{path $.BasePath (printf "/topic/%s" .Name)}}">{{.Name}}</a>
     {{if .IsInternal}}<span class="badge neutral">internal</span>{{end}}
     {{if .Stale}}<span class="badge neutral">stale</span>{{end}}
   </td>

@@ -29,24 +29,31 @@ func Migrate(ctx context.Context, db *sql.DB, migrations fs.FS) error {
 	}
 
 	// migrations are sequential: 001_init.up.sql, 002_*.up.sql, ...
+	// engine restricts a file to one driver. SQLite still records the version
+	// so both engines stay on the same schema number.
 	type migration struct {
 		version int
 		file    string
+		engine  string
 	}
 	all := []migration{
-		{1, "migrations/001_init.up.sql"},
-		{2, "migrations/002_growth_threshold.up.sql"},
+		{1, "migrations/001_init.up.sql", ""},
+		{2, "migrations/002_growth_threshold.up.sql", ""},
+		{3, "migrations/003_topic_collation.up.sql", "mariadb"},
 	}
+	engine := schemaEngine(ctx, db)
 	for _, m := range all {
 		if current >= m.version {
 			continue
 		}
-		sqlBytes, err := fs.ReadFile(migrations, m.file)
-		if err != nil {
-			return fmt.Errorf("store: read %s: %w", m.file, err)
-		}
-		if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
-			return fmt.Errorf("store: apply %s: %w", m.file, err)
+		if m.engine == "" || m.engine == engine {
+			sqlBytes, err := fs.ReadFile(migrations, m.file)
+			if err != nil {
+				return fmt.Errorf("store: read %s: %w", m.file, err)
+			}
+			if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
+				return fmt.Errorf("store: apply %s: %w", m.file, err)
+			}
 		}
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO `+schemaTable+` (version, applied_at) VALUES (?, ?)`,
@@ -56,6 +63,14 @@ func Migrate(ctx context.Context, db *sql.DB, migrations fs.FS) error {
 		}
 	}
 	return nil
+}
+
+func schemaEngine(ctx context.Context, db *sql.DB) string {
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT sqlite_version()").Scan(&version); err == nil && version != "" {
+		return "sqlite"
+	}
+	return "mariadb"
 }
 
 func bindUTC(t time.Time) time.Time { return t.UTC() }

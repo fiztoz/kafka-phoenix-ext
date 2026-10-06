@@ -18,8 +18,8 @@
     </div>
   </div>
   <div class="actions">
-    <a class="btn" href="{{.BasePath}}/">All topics</a>
-    <a class="btn" href="{{.BasePath}}/wallboard">Wallboard</a>
+    <a class="btn" href="{{path .BasePath "/"}}">All topics</a>
+    <a class="btn" href="{{path .BasePath "/wallboard"}}">Wallboard</a>
   </div>
 </header>
 
@@ -45,7 +45,7 @@
   <tbody>
   {{range .Hosted}}
   <tr>
-    <td><a class="mono" href="{{$.BasePath}}/topic/{{.Name}}">{{.Name}}</a></td>
+    <td><a class="mono" href="{{path $.BasePath (printf "/topic/%s" .Name)}}">{{.Name}}</a></td>
     <td class="num">{{.Copies}}</td>
     <td class="num">{{.LeaderParts}}</td>
     <td class="num">{{bytes .LeaderBytes}}</td>
@@ -72,7 +72,7 @@
   <tbody>
   {{range .Leaders}}
   <tr>
-    <td><a class="mono" href="{{$.BasePath}}/topic/{{.Topic}}">{{.Topic}}</a></td>
+    <td><a class="mono" href="{{path $.BasePath (printf "/topic/%s" .Topic)}}">{{.Topic}}</a></td>
     <td class="num">{{.Partition}}</td>
     <td class="num">{{bytes .SizeBytes}}</td>
   </tr>

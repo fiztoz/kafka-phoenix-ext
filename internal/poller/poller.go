@@ -52,6 +52,11 @@ type TopicView struct {
 
 	RepStreak        int  // consecutive polls with under-rep/offline partitions
 	ReplicaConfirmed bool // RepStreak >= confirmSamples
+
+	// ReplicaUnavailable means this sample cannot prove replica health.
+	ReplicaUnavailable bool
+	// SizeIncomplete means this topic's byte total omitted a known replica.
+	SizeIncomplete bool
 }
 
 // Snapshot is the poller's last observation.
@@ -70,6 +75,14 @@ type Snapshot struct {
 	SkewStreak    int     // consecutive polls over the skew policy
 	SkewBrokerID  int32   // hottest broker in the last sample (-1 = unknown)
 	SkewSharePct  float64 // hottest broker's share of broker-reported bytes
+
+	// SizeIncomplete means the visible byte totals omit a failed broker or
+	// directory. Alarms and the growth baseline stay on the last complete sample.
+	SizeIncomplete bool
+	// MetadataUnavailable means replica health is unknown, not healthy.
+	MetadataUnavailable bool
+	// StorageError is a failed durability write. Alert state still advances.
+	StorageError string
 }
 
 // SkewPolicy is the broker disk-skew alert policy. SharePct is the share of
@@ -200,12 +213,17 @@ func (p *Poller) Run(ctx context.Context) {
 	}
 }
 
-// Snapshot returns the last observation (safe for concurrent readers).
+// Snapshot returns an immutable copy of the last observation. Callers may
+// read it after this method returns; later polls and threshold refreshes do
+// not mutate the returned value.
 func (p *Poller) Snapshot() Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.snap
+	return cloneSnapshot(p.snap)
 }
+
+// PollOnce runs one observation. Run calls it on each interval.
+func (p *Poller) PollOnce(ctx context.Context) { p.tick(ctx) }
 
 // StaleThreshold is how old a sample must be before the UI flags it stale.
 func (p *Poller) StaleThreshold() time.Duration { return 3 * p.interval }
@@ -233,119 +251,25 @@ func (p *Poller) tick(ctx context.Context) {
 	}
 
 	p.mu.Lock()
-	rows := make([]store.StateRow, 0, len(described.Topics))
-	for _, tu := range described.Topics {
-		ps, hasPrev := p.prev[tu.Name]
-		var prevAt *time.Time
-		if hasPrev && !ps.at.IsZero() {
-			prevAt = &ps.at
-		}
-		thr, hasThr := p.thresholds[tu.Name]
-		streak := 0
-		if hasThr && tu.StorageBytes >= thr.ThresholdBytes {
-			streak = p.streaks[tu.Name] + 1
-		}
-		confirmed := streak >= confirmSamples
-		rows = append(rows, store.StateRow{
-			Topic:         tu.Name,
-			Partitions:    tu.Partitions,
-			StorageBytes:  tu.StorageBytes,
-			PrevBytes:     ps.bytes,
-			PolledAt:      now,
-			PrevPolledAt:  prevAt,
-			OverStreak:    streak,
-			ConfirmedOver: confirmed,
-		})
-	}
-
-	// Build the fresh snapshot from the described cluster plus hysteresis.
-	// Windows/streaks are computed against provisional values first; they
-	// only become durable state after the store write succeeds (below).
-	p.snap = Snapshot{
-		ClusterID:    described.ClusterID,
-		ControllerID: described.ControllerID,
-		PolledAt:     now,
-		PollOK:       true,
-		LastError:    "",
-		TotalBytes:   described.TotalBytes,
-		Brokers:      described.Brokers,
-		BrokerErrors: described.BrokerErrors,
-		Topics:       make([]TopicView, 0, len(described.Topics)),
-	}
-	wins := make([][]prevSample, len(described.Topics))
-	repStreaks := make([]int, len(described.Topics))
-	growStreaks := make([]int, len(described.Topics))
-	for i := range described.Topics {
-		tu := described.Topics[i]
-		tv := TopicView{
-			Name:          tu.Name,
-			Partitions:    tu.Partitions,
-			Replicas:      tu.Replicas,
-			StorageBytes:  tu.StorageBytes,
-			LeaderBytes:   tu.LeaderBytes,
-			IsInternal:    tu.IsInternal,
-			UnderRep:      tu.UnderRep,
-			Offline:       tu.Offline,
-			Parts:         tu.Parts,
-			PartitionSkew: partitionSkew(tu.Parts),
-		}
-
-		win := append(append([]prevSample{}, p.windows[tu.Name]...), prevSample{bytes: tu.StorageBytes, at: now})
-		if len(win) > windowLen {
-			win = win[len(win)-windowLen:]
-		}
-		wins[i] = win
-		tv.PrevBytes, tv.PrevPolledAt, tv.GrowthPerHour = growthFromWindow(win)
-
-		if tu.UnderRep > 0 || tu.Offline > 0 {
-			repStreaks[i] = p.repStreaks[tu.Name] + 1
-		}
-		tv.RepStreak = repStreaks[i]
-		tv.ReplicaConfirmed = repStreaks[i] >= confirmSamples
-
-		if thr, ok := p.thresholds[tu.Name]; ok {
-			tv.ThresholdBytes = &thr.ThresholdBytes
-			tv.WarnBytes = thr.WarnBytes
-			tv.OverStreak = rows[i].OverStreak
-			tv.ConfirmedOver = rows[i].ConfirmedOver
-			tv.GrowthThreshold = thr.GrowthPerHour
-			if thr.GrowthPerHour != nil && tv.GrowthPerHour >= *thr.GrowthPerHour {
-				growStreaks[i] = p.growStreaks[tu.Name] + 1
-			}
-			tv.GrowthStreak = growStreaks[i]
-			tv.GrowthConfirmed = growStreaks[i] >= confirmSamples
-		}
-		tv.HoursToLimit = hoursToLimit(tv.ThresholdBytes, tv.StorageBytes, tv.GrowthPerHour)
-		p.snap.Topics = append(p.snap.Topics, tv)
-	}
-
-	hotID, share, over := evaluateSkew(described.Brokers, p.skew)
-	skewStreak := 0
-	if over {
-		skewStreak = p.skewStreak + 1
-	}
-	p.snap.SkewBrokerID = hotID
-	p.snap.SkewSharePct = share
-	p.snap.SkewStreak = skewStreak
-	p.snap.SkewConfirmed = skewStreak >= confirmSamples
+	rows := p.observeLocked(described, now)
 	p.mu.Unlock()
 
+	if described.SizeIncomplete {
+		p.log.Warn("poller: incomplete size observation; preserving alarms and growth baseline",
+			"errors", described.BrokerErrors)
+		return
+	}
 	if err := p.store.UpsertStates(ctx, rows); err != nil {
-		// Data is still fresh; only the durable state is a casualty. Do not
-		// advance prev/streaks/windows so the next tick retries with the same
-		// baseline and hysteresis counters.
+		// In-memory alert state already advanced. Durability is retried from
+		// the next observation; this sample is not applied twice.
+		p.mu.Lock()
+		p.snap.StorageError = fmt.Sprintf("persist: %v", err)
+		p.mu.Unlock()
 		p.log.Error("poller: could not persist states", "err", err)
 		return
 	}
 	p.mu.Lock()
-	for i, r := range rows {
-		p.prev[r.Topic] = prevSample{bytes: r.StorageBytes, at: r.PolledAt}
-		p.streaks[r.Topic] = r.OverStreak
-		p.repStreaks[r.Topic] = repStreaks[i]
-		p.growStreaks[r.Topic] = growStreaks[i]
-		p.windows[r.Topic] = wins[i]
-	}
-	p.skewStreak = skewStreak
+	p.snap.StorageError = ""
 	p.mu.Unlock()
 
 	p.log.Debug("poller: tick complete", "topics", len(described.Topics),

@@ -21,6 +21,7 @@ type pageData struct {
 	PolledAt     time.Time
 	PollOK       bool
 	LastError    string
+	StorageError string
 	TotalBytes   int64
 	Topics       []poller.TopicView
 
@@ -211,6 +212,7 @@ func (s *Server) dashboardData() pageData {
 		PolledAt:     snap.PolledAt,
 		PollOK:       snap.PollOK,
 		LastError:    snap.LastError,
+		StorageError: snap.StorageError,
 		TotalBytes:   snap.TotalBytes,
 		Topics:       snap.Topics,
 		Brokers:      make([]apiBroker, 0, len(snap.Brokers)),
@@ -308,7 +310,7 @@ func wallboardOrder(ts []poller.TopicView) []poller.TopicView {
 // and redirects back to the dashboard.
 func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
 	redirect := func() {
-		http.Redirect(w, r, s.deps.BasePath+"/", http.StatusSeeOther)
+		http.Redirect(w, r, JoinPath(s.deps.BasePath, "/"), http.StatusSeeOther)
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
@@ -348,7 +350,7 @@ func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
 // handleThresholdDeleteForm removes a threshold from the UI.
 func (s *Server) handleThresholdDeleteForm(w http.ResponseWriter, r *http.Request) {
 	redirect := func() {
-		http.Redirect(w, r, s.deps.BasePath+"/", http.StatusSeeOther)
+		http.Redirect(w, r, JoinPath(s.deps.BasePath, "/"), http.StatusSeeOther)
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)

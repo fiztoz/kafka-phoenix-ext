@@ -74,12 +74,16 @@ func (f *fakeStore) Thresholds(context.Context) (map[string]store.ThresholdRow, 
 }
 
 func newTestServer(t *testing.T, snap poller.Snapshot, uiToken string) (*Server, *fakeSnapshots, *fakeStore) {
+	return newTestServerAt(t, snap, uiToken, "/kafka")
+}
+
+func newTestServerAt(t *testing.T, snap poller.Snapshot, uiToken, base string) (*Server, *fakeSnapshots, *fakeStore) {
 	t.Helper()
 	fs := &fakeSnapshots{snap: snap, stale: 30 * time.Minute}
 	fs.set(snap)
 	st := newFakeStore()
 	srv, err := New(Deps{
-		BasePath:  "/kafka",
+		BasePath:  base,
 		UIToken:   uiToken,
 		Snapshots: fs,
 		Store:     st,

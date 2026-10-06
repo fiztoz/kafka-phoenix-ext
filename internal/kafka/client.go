@@ -31,7 +31,7 @@ type ClientOptions struct {
 // Client wraps a franz-go kgo client and its kadm admin surface.
 type Client struct {
 	kgo  *kgo.Client
-	adm  *kadm.Client
+	adm  clusterAdmin
 	opts ClientOptions
 }
 
