@@ -78,6 +78,7 @@
     <a class="btn" href="{{path .BasePath "/"}}">Exit wallboard</a>
   </div>
 </header>
+{{template "clusternav" .}}
 
 {{if .StorageError}}
 <div class="banner warn">Durability write failed. Alerts still advance in memory. <span class="hint">{{.StorageError}}</span></div>

@@ -1,5 +1,10 @@
 // Package http serves the kafka-phoenix-ext dashboard, wallboard, JSON API
 // and health endpoints. It renders server-side Go templates — no JS framework.
+//
+// Routes are cluster-scoped: /c/{cluster}/... for the UI and
+// /health/c/{cluster}/... for Phoenix monitors. The unprefixed routes
+// (/health/ready, /topic/{name}, ...) stay bound to one legacy cluster so
+// monitors written for the single-cluster layout keep working.
 package http
 
 import (
@@ -19,35 +24,42 @@ import (
 	"github.com/fiztoz/kafka-phoenix-ext/internal/store"
 )
 
-//go:embed views/styles.html views/dashboard.html views/topic.html views/wallboard.html views/broker.html views/icon.svg
+//go:embed views/styles.html views/dashboard.html views/topic.html views/wallboard.html views/broker.html views/overview.html views/clusternav.html views/icon.svg
 var assets embed.FS
 
-// SnapshotSource is what the HTTP layer reads from the poller.
-type SnapshotSource interface {
-	Snapshot() poller.Snapshot
+// ClusterSource is what the HTTP layer reads from the poller manager.
+type ClusterSource interface {
+	// Clusters returns the configured cluster ids in declaration order.
+	Clusters() []string
+	// Snapshot returns one cluster's last observation; false when unknown.
+	Snapshot(cluster string) (poller.Snapshot, bool)
+	// StaleThreshold is how old a sample must be before the UI flags it stale.
 	StaleThreshold() time.Duration
 }
 
-// thresholdRefresher is optionally implemented by SnapshotSource (the poller
-// does) so threshold mutations become visible without waiting for the next
-// poll.
+// thresholdRefresher is optionally implemented by ClusterSource (the poller
+// manager does) so threshold mutations become visible without waiting for
+// the next poll.
 type thresholdRefresher interface {
-	RefreshThresholds(ctx context.Context)
+	RefreshThresholds(ctx context.Context, cluster string)
 }
 
-func (s *Server) refreshThresholds(r *http.Request) {
-	if rf, ok := s.deps.Snapshots.(thresholdRefresher); ok {
-		rf.RefreshThresholds(r.Context())
+func (s *Server) refreshThresholds(r *http.Request, cluster string) {
+	if rf, ok := s.deps.Clusters.(thresholdRefresher); ok {
+		rf.RefreshThresholds(r.Context(), cluster)
 	}
 }
 
 // Deps wires the server.
 type Deps struct {
-	BasePath  string // e.g. "/kafka"; "/" for local dev
-	UIToken   string // empty = UI open (health is always open)
-	Snapshots SnapshotSource
-	Store     store.Store
-	Log       *slog.Logger
+	BasePath string // e.g. "/kafka"; "/" for local dev
+	UIToken  string // empty = UI open (health is always open)
+	Clusters ClusterSource
+	Store    store.Store
+	Log      *slog.Logger
+	// LegacyCluster serves the unprefixed routes. Empty means the first
+	// configured cluster.
+	LegacyCluster string
 }
 
 // Server is the kafka-phoenix-ext HTTP server.
@@ -74,8 +86,9 @@ func New(deps Deps) (*Server, error) {
 		"path":   JoinPath,
 	}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(assets,
-		"views/styles.html", "views/dashboard.html", "views/topic.html",
-		"views/wallboard.html", "views/broker.html")
+		"views/styles.html", "views/clusternav.html", "views/dashboard.html",
+		"views/topic.html", "views/wallboard.html", "views/broker.html",
+		"views/overview.html")
 	if err != nil {
 		return nil, fmt.Errorf("http: parse templates: %w", err)
 	}
@@ -83,7 +96,21 @@ func New(deps Deps) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("http: read icon: %w", err)
 	}
+	if deps.LegacyCluster == "" {
+		if ids := deps.Clusters.Clusters(); len(ids) > 0 {
+			deps.LegacyCluster = ids[0]
+		}
+	}
 	return &Server{deps: deps, tmpl: tmpl, icon: icon}, nil
+}
+
+// clusterHandler is a handler bound to one configured cluster id.
+type clusterHandler func(w http.ResponseWriter, r *http.Request, cluster string)
+
+// scoped binds a cluster id to a handler. Legacy routes bind the legacy
+// cluster; /c/{id}/ routes bind the id from the route table.
+func scoped(cluster string, h clusterHandler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { h(w, r, cluster) }
 }
 
 // Handler returns the mux with routes registered under BASE_PATH and, when
@@ -101,28 +128,63 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) register(mux *http.ServeMux, prefix string) {
 	p := strings.TrimRight(prefix, "/")
 
-	// Open routes.
+	// Open routes that are not cluster-specific.
 	mux.HandleFunc("GET "+p+"/icon.svg", s.securityHeaders(s.handleIcon))
 	mux.HandleFunc("GET "+p+"/health/live", s.securityHeaders(s.handleLive))
-	mux.HandleFunc("GET "+p+"/health/ready", s.securityHeaders(s.handleReady))
-	mux.HandleFunc("GET "+p+"/health/thresholds", s.securityHeaders(s.handleThresholdsAll))
-	mux.HandleFunc("GET "+p+"/health/thresholds/{topic}", s.securityHeaders(s.handleThresholdsTopic))
-	mux.HandleFunc("GET "+p+"/health/replicas", s.securityHeaders(s.handleHealthReplicas))
-	mux.HandleFunc("GET "+p+"/health/growth", s.securityHeaders(s.handleHealthGrowth))
-	mux.HandleFunc("GET "+p+"/health/brokers", s.securityHeaders(s.handleHealthBrokers))
+	mux.HandleFunc("GET "+p+"/health/clusters", s.securityHeaders(s.handleHealthClusters))
 
-	// UI-token-guarded routes (open when UI_TOKEN is empty).
-	mux.HandleFunc("GET "+p+"/", s.securityHeaders(s.uiAuth(s.handleDashboard)))
-	mux.HandleFunc("GET "+p+"/wallboard", s.securityHeaders(s.uiAuth(s.handleWallboard)))
-	mux.HandleFunc("GET "+p+"/topic/{name}", s.securityHeaders(s.uiAuth(s.handleTopicPage)))
-	mux.HandleFunc("GET "+p+"/broker/{id}", s.securityHeaders(s.uiAuth(s.handleBrokerPage)))
-	mux.HandleFunc("POST "+p+"/thresholds", s.securityHeaders(s.uiAuth(s.handleThresholdForm)))
-	mux.HandleFunc("POST "+p+"/thresholds/delete", s.securityHeaders(s.uiAuth(s.handleThresholdDeleteForm)))
-	mux.HandleFunc("GET "+p+"/api/topics", s.securityHeaders(s.uiAuth(s.handleAPITopics)))
-	mux.HandleFunc("GET "+p+"/api/topics/{topic}", s.securityHeaders(s.uiAuth(s.handleAPITopic)))
-	mux.HandleFunc("GET "+p+"/api/brokers", s.securityHeaders(s.uiAuth(s.handleAPIBrokers)))
-	mux.HandleFunc("POST "+p+"/api/thresholds", s.securityHeaders(s.uiAuth(s.handleAPISetThreshold)))
-	mux.HandleFunc("DELETE "+p+"/api/thresholds/{topic}", s.securityHeaders(s.uiAuth(s.handleAPIDeleteThreshold)))
+	// Landing: the single cluster's dashboard, or the overview when several
+	// clusters are polled.
+	mux.HandleFunc("GET "+p+"/", s.securityHeaders(s.uiAuth(s.handleLanding)))
+
+	for _, id := range s.deps.Clusters.Clusters() {
+		cp := p + "/c/" + id
+		// UI-token-guarded routes (open when UI_TOKEN is empty).
+		mux.HandleFunc("GET "+cp, s.securityHeaders(s.uiAuth(scoped(id, s.handleDashboard))))
+		mux.HandleFunc("GET "+cp+"/", s.securityHeaders(s.uiAuth(scoped(id, s.handleDashboard))))
+		mux.HandleFunc("GET "+cp+"/wallboard", s.securityHeaders(s.uiAuth(scoped(id, s.handleWallboard))))
+		mux.HandleFunc("GET "+cp+"/topic/{name}", s.securityHeaders(s.uiAuth(scoped(id, s.handleTopicPage))))
+		mux.HandleFunc("GET "+cp+"/broker/{broker}", s.securityHeaders(s.uiAuth(scoped(id, s.handleBrokerPage))))
+		mux.HandleFunc("POST "+cp+"/thresholds", s.securityHeaders(s.uiAuth(scoped(id, s.handleThresholdForm))))
+		mux.HandleFunc("POST "+cp+"/thresholds/delete", s.securityHeaders(s.uiAuth(scoped(id, s.handleThresholdDeleteForm))))
+		mux.HandleFunc("GET "+cp+"/api/topics", s.securityHeaders(s.uiAuth(scoped(id, s.handleAPITopics))))
+		mux.HandleFunc("GET "+cp+"/api/topics/{topic}", s.securityHeaders(s.uiAuth(scoped(id, s.handleAPITopic))))
+		mux.HandleFunc("GET "+cp+"/api/brokers", s.securityHeaders(s.uiAuth(scoped(id, s.handleAPIBrokers))))
+		mux.HandleFunc("POST "+cp+"/api/thresholds", s.securityHeaders(s.uiAuth(scoped(id, s.handleAPISetThreshold))))
+		mux.HandleFunc("DELETE "+cp+"/api/thresholds/{topic}", s.securityHeaders(s.uiAuth(scoped(id, s.handleAPIDeleteThreshold))))
+
+		// Per-cluster Phoenix monitors. Always open: Phoenix HTTP monitors
+		// carry no UI token.
+		hp := p + "/health/c/" + id
+		mux.HandleFunc("GET "+hp+"/ready", s.securityHeaders(scoped(id, s.handleReady)))
+		mux.HandleFunc("GET "+hp+"/thresholds", s.securityHeaders(scoped(id, s.handleThresholdsAll)))
+		mux.HandleFunc("GET "+hp+"/thresholds/{topic}", s.securityHeaders(scoped(id, s.handleThresholdsTopic)))
+		mux.HandleFunc("GET "+hp+"/replicas", s.securityHeaders(scoped(id, s.handleHealthReplicas)))
+		mux.HandleFunc("GET "+hp+"/growth", s.securityHeaders(scoped(id, s.handleHealthGrowth)))
+		mux.HandleFunc("GET "+hp+"/brokers", s.securityHeaders(scoped(id, s.handleHealthBrokers)))
+	}
+
+	// Legacy unprefixed routes, bound to the legacy cluster. These exist so a
+	// single-cluster install upgrades without touching its Phoenix monitors.
+	if legacy := s.deps.LegacyCluster; legacy != "" {
+		mux.HandleFunc("GET "+p+"/wallboard", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleWallboard))))
+		mux.HandleFunc("GET "+p+"/topic/{name}", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleTopicPage))))
+		mux.HandleFunc("GET "+p+"/broker/{broker}", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleBrokerPage))))
+		mux.HandleFunc("POST "+p+"/thresholds", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleThresholdForm))))
+		mux.HandleFunc("POST "+p+"/thresholds/delete", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleThresholdDeleteForm))))
+		mux.HandleFunc("GET "+p+"/api/topics", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleAPITopics))))
+		mux.HandleFunc("GET "+p+"/api/topics/{topic}", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleAPITopic))))
+		mux.HandleFunc("GET "+p+"/api/brokers", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleAPIBrokers))))
+		mux.HandleFunc("POST "+p+"/api/thresholds", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleAPISetThreshold))))
+		mux.HandleFunc("DELETE "+p+"/api/thresholds/{topic}", s.securityHeaders(s.uiAuth(scoped(legacy, s.handleAPIDeleteThreshold))))
+
+		mux.HandleFunc("GET "+p+"/health/ready", s.securityHeaders(scoped(legacy, s.handleReady)))
+		mux.HandleFunc("GET "+p+"/health/thresholds", s.securityHeaders(scoped(legacy, s.handleThresholdsAll)))
+		mux.HandleFunc("GET "+p+"/health/thresholds/{topic}", s.securityHeaders(scoped(legacy, s.handleThresholdsTopic)))
+		mux.HandleFunc("GET "+p+"/health/replicas", s.securityHeaders(scoped(legacy, s.handleHealthReplicas)))
+		mux.HandleFunc("GET "+p+"/health/growth", s.securityHeaders(scoped(legacy, s.handleHealthGrowth)))
+		mux.HandleFunc("GET "+p+"/health/brokers", s.securityHeaders(scoped(legacy, s.handleHealthBrokers)))
+	}
 }
 
 // securityHeaders sets the locked header set on every response.
@@ -221,33 +283,68 @@ func (s *Server) handleLive(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+// handleHealthClusters is the aggregate readiness monitor: 503 while any
+// configured cluster has no successful poll. Per-cluster detail (thresholds,
+// replicas, growth, broker skew) lives at /health/c/{cluster}/* so one noisy
+// cluster cannot be confused with another.
+func (s *Server) handleHealthClusters(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	var failed []string
+	for _, id := range s.deps.Clusters.Clusters() {
+		snap, ok := s.deps.Clusters.Snapshot(id)
+		if !ok {
+			failed = append(failed, id+" (unknown)")
+			continue
+		}
+		if !snap.PollOK {
+			failed = append(failed, id+" ("+readyMessage(snap)+")")
+		}
+	}
+	if len(failed) == 0 {
+		_, _ = w.Write([]byte("ok"))
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = fmt.Fprintf(w, "cluster poll failing: %s", strings.Join(failed, "; "))
+}
+
+// readyMessage explains why one cluster is not ready. An ACL problem must
+// never be reported as "unreachable": the on-call response differs.
+func readyMessage(snap poller.Snapshot) string {
+	if snap.LastError == "" {
+		return "no successful poll yet"
+	}
+	if classifyErr(snap.LastError) == errAuth {
+		return "authenticated but missing ACLs: " + snap.LastError
+	}
+	return snap.LastError
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	if snap.PollOK {
 		_, _ = w.Write([]byte("ok"))
 		return
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
-	if snap.LastError == "" {
-		_, _ = w.Write([]byte("no successful poll yet"))
-		return
-	}
-	// Classify so an ACL problem is never reported as "kafka unreachable":
-	// the on-call response to each is different.
-	if classifyErr(snap.LastError) == errAuth {
-		_, _ = w.Write([]byte("authenticated but missing ACLs: " + snap.LastError))
-		return
-	}
-	_, _ = w.Write([]byte(snap.LastError))
+	_, _ = w.Write([]byte(readyMessage(snap)))
 }
 
 // handleHealthReplicas is 503 while any topic stays under-replicated or
 // offline across confirmSamples polls. Metadata alone feeds this, so it
 // needs no extra ACLs beyond what the poller already uses.
-func (s *Server) handleHealthReplicas(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+func (s *Server) handleHealthReplicas(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	for _, t := range snap.Topics {
 		if t.ReplicaConfirmed {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -275,9 +372,13 @@ func replicaObservationUnavailable(snap poller.Snapshot) bool {
 
 // handleHealthGrowth is 503 while any topic's rolling growth rate stays at
 // or above its operator-set growth limit across confirmSamples polls.
-func (s *Server) handleHealthGrowth(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+func (s *Server) handleHealthGrowth(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	for _, t := range snap.Topics {
 		if t.GrowthConfirmed {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -292,9 +393,13 @@ func (s *Server) handleHealthGrowth(w http.ResponseWriter, _ *http.Request) {
 // handleHealthBrokers is 503 while the hottest broker stays over the skew
 // policy (share of cluster bytes or absolute cap) across confirmSamples
 // polls.
-func (s *Server) handleHealthBrokers(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+func (s *Server) handleHealthBrokers(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	if snap.SkewConfirmed {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = fmt.Fprintf(w, "broker %d holds %.1f%% of cluster storage for %d consecutive polls",
@@ -304,9 +409,13 @@ func (s *Server) handleHealthBrokers(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (s *Server) handleThresholdsAll(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+func (s *Server) handleThresholdsAll(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	for _, t := range snap.Topics {
 		if t.ConfirmedOver {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -317,10 +426,14 @@ func (s *Server) handleThresholdsAll(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (s *Server) handleThresholdsTopic(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleThresholdsTopic(w http.ResponseWriter, r *http.Request, cluster string) {
 	name := r.PathValue("topic")
-	snap := s.deps.Snapshots.Snapshot()
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	for _, t := range snap.Topics {
 		if t.Name == name {
 			if t.ThresholdBytes == nil {
@@ -386,6 +499,7 @@ type apiPartition struct {
 }
 
 type apiResponse struct {
+	Cluster             string      `json:"cluster"`
 	ClusterID           string      `json:"cluster_id"`
 	ControllerID        int32       `json:"controller_id"`
 	PolledAt            time.Time   `json:"polled_at"`
@@ -415,6 +529,7 @@ type apiBrokerShare struct {
 }
 
 type apiBrokersResponse struct {
+	Cluster          string           `json:"cluster"`
 	ClusterID        string           `json:"cluster_id"`
 	PolledAt         time.Time        `json:"polled_at"`
 	PollOK           bool             `json:"poll_ok"`
@@ -427,14 +542,22 @@ type apiBrokersResponse struct {
 	SkewSharePct     float64          `json:"skew_share_pct"`
 }
 
-func (s *Server) handleAPITopics(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+func (s *Server) handleAPITopics(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		writeJSONErr(w, http.StatusNotFound, "unknown cluster")
+		return
+	}
 	writeJSON(w, http.StatusOK, toAPIResponse(s, snap, nil))
 }
 
-func (s *Server) handleAPITopic(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAPITopic(w http.ResponseWriter, r *http.Request, cluster string) {
 	name := r.PathValue("topic")
-	snap := s.deps.Snapshots.Snapshot()
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		writeJSONErr(w, http.StatusNotFound, "unknown cluster")
+		return
+	}
 	for _, t := range snap.Topics {
 		if t.Name != name {
 			continue
@@ -454,6 +577,7 @@ func (s *Server) handleAPITopic(w http.ResponseWriter, r *http.Request) {
 		}
 		body := toAPIResponse(s, snap, &t)
 		writeJSON(w, http.StatusOK, map[string]any{
+			"cluster":    body.Cluster,
 			"topic":      body.Topics[0],
 			"partitions": parts,
 		})
@@ -464,6 +588,7 @@ func (s *Server) handleAPITopic(w http.ResponseWriter, r *http.Request) {
 
 func toAPIResponse(s *Server, snap poller.Snapshot, only *poller.TopicView) apiResponse {
 	resp := apiResponse{
+		Cluster:             snap.Cluster,
 		ClusterID:           snap.ClusterID,
 		ControllerID:        snap.ControllerID,
 		PolledAt:            snap.PolledAt.UTC(),
@@ -473,7 +598,7 @@ func toAPIResponse(s *Server, snap poller.Snapshot, only *poller.TopicView) apiR
 		SizeIncomplete:      snap.SizeIncomplete,
 		MetadataUnavailable: snap.MetadataUnavailable,
 		TotalBytes:          snap.TotalBytes,
-		StaleAfterSeconds:   int64(s.deps.Snapshots.StaleThreshold().Seconds()),
+		StaleAfterSeconds:   int64(s.deps.Clusters.StaleThreshold().Seconds()),
 		Brokers:             make([]apiBroker, 0, len(snap.Brokers)),
 		BrokerErrors:        snap.BrokerErrors,
 		Topics:              make([]apiTopic, 0, len(snap.Topics)),
@@ -516,13 +641,18 @@ func toAPIResponse(s *Server, snap poller.Snapshot, only *poller.TopicView) apiR
 }
 
 // handleAPIBrokers serves the per-broker storage view for automation (#12).
-func (s *Server) handleAPIBrokers(w http.ResponseWriter, _ *http.Request) {
-	snap := s.deps.Snapshots.Snapshot()
+func (s *Server) handleAPIBrokers(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		writeJSONErr(w, http.StatusNotFound, "unknown cluster")
+		return
+	}
 	var total int64
 	for _, b := range snap.Brokers {
 		total += b.Bytes
 	}
 	resp := apiBrokersResponse{
+		Cluster:          snap.Cluster,
 		ClusterID:        snap.ClusterID,
 		PolledAt:         snap.PolledAt.UTC(),
 		PollOK:           snap.PollOK,
@@ -554,13 +684,13 @@ type thresholdRequest struct {
 	GrowthPerHour  *int64 `json:"growth_bytes_per_hour"`
 }
 
-func (s *Server) handleAPISetThreshold(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAPISetThreshold(w http.ResponseWriter, r *http.Request, cluster string) {
 	var body thresholdRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if err := s.setThreshold(r, body); err != nil {
+	if err := s.setThreshold(r, cluster, body); err != nil {
 		switch err {
 		case errUnknownTopic:
 			writeJSONErr(w, http.StatusNotFound, err.Error())
@@ -570,6 +700,7 @@ func (s *Server) handleAPISetThreshold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"cluster":               cluster,
 		"topic":                 body.Topic,
 		"threshold_bytes":       body.ThresholdBytes,
 		"warn_bytes":            body.WarnBytes,
@@ -577,20 +708,20 @@ func (s *Server) handleAPISetThreshold(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleAPIDeleteThreshold(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAPIDeleteThreshold(w http.ResponseWriter, r *http.Request, cluster string) {
 	topic := r.PathValue("topic")
-	if err := s.deps.Store.DeleteThreshold(r.Context(), topic); err != nil {
-		s.deps.Log.Error("delete threshold failed", "err", err)
+	if err := s.deps.Store.Scoped(cluster).DeleteThreshold(r.Context(), topic); err != nil {
+		s.deps.Log.Error("delete threshold failed", "cluster", cluster, "err", err)
 		writeJSONErr(w, http.StatusInternalServerError, "store error")
 		return
 	}
-	s.refreshThresholds(r)
+	s.refreshThresholds(r, cluster)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 var errUnknownTopic = fmt.Errorf("unknown topic")
 
-func (s *Server) setThreshold(r *http.Request, q thresholdRequest) error {
+func (s *Server) setThreshold(r *http.Request, cluster string, q thresholdRequest) error {
 	if err := validateTopic(q.Topic); err != nil {
 		return err
 	}
@@ -603,7 +734,10 @@ func (s *Server) setThreshold(r *http.Request, q thresholdRequest) error {
 	if q.GrowthPerHour != nil && *q.GrowthPerHour <= 0 {
 		return fmt.Errorf("growth_bytes_per_hour must be a positive integer")
 	}
-	snap := s.deps.Snapshots.Snapshot()
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		return errUnknownCluster
+	}
 	known := false
 	for _, t := range snap.Topics {
 		if t.Name == q.Topic {
@@ -616,13 +750,15 @@ func (s *Server) setThreshold(r *http.Request, q thresholdRequest) error {
 		// can carry a threshold.
 		return errUnknownTopic
 	}
-	if err := s.deps.Store.SetThreshold(r.Context(), q.Topic, q.ThresholdBytes, q.WarnBytes, q.GrowthPerHour); err != nil {
-		s.deps.Log.Error("set threshold failed", "err", err)
+	if err := s.deps.Store.Scoped(cluster).SetThreshold(r.Context(), q.Topic, q.ThresholdBytes, q.WarnBytes, q.GrowthPerHour); err != nil {
+		s.deps.Log.Error("set threshold failed", "cluster", cluster, "err", err)
 		return fmt.Errorf("store error")
 	}
-	s.refreshThresholds(r)
+	s.refreshThresholds(r, cluster)
 	return nil
 }
+
+var errUnknownCluster = fmt.Errorf("unknown cluster")
 
 func validateTopic(name string) error {
 	if len(name) < 1 || len(name) > 249 {

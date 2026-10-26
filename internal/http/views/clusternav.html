@@ -1,0 +1,16 @@
+{{define "clusternav"}}
+{{if .Multi}}
+<nav class="clusters" aria-label="Kafka clusters">
+  {{range .Clusters}}
+  <a class="clink{{if .Active}} active{{end}}" href="{{.URL}}"{{if .Active}} aria-current="page"{{end}}>
+    <span class="dot{{if not .PollOK}} bad{{end}}" aria-hidden="true"></span>
+    <span class="cid">{{.ID}}</span>
+    <span class="cmeta">{{bytes .TotalBytes}} · {{.Topics}} topics</span>
+    {{if .Alerts}}<span class="alerts" title="confirmed alerts">{{.Alerts}} alert{{if gt .Alerts 1}}s{{end}}</span>{{end}}
+    {{if not .PollOK}}<span class="alerts">down</span>{{end}}
+  </a>
+  {{end}}
+  <a class="clink" href="{{.OverviewURL}}">all clusters</a>
+</nav>
+{{end}}
+{{end}}

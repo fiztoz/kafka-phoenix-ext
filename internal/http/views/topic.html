@@ -29,6 +29,7 @@ h1.topic { font-family:var(--mono); font-variant-numeric:tabular-nums; overflow-
     <a class="btn" href="{{path .BasePath "/wallboard"}}">Wallboard</a>
   </div>
 </header>
+{{template "clusternav" .}}
 
 {{if .Topic.ReplicaConfirmed}}
 <div class="banner bad">Under-replicated or offline partitions confirmed across {{.Topic.RepStreak}} consecutive polls.</div>

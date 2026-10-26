@@ -43,6 +43,8 @@ func newFakeStore() *fakeStore {
 	}
 }
 
+func (f *fakeStore) Cluster() string { return "default" }
+
 func (f *fakeStore) UpsertStates(_ context.Context, rows []store.StateRow) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -122,7 +124,7 @@ func cluster(topic string, bytes int64) *kafka.ClusterSnapshot {
 
 func newTestPoller(ctx context.Context, t *testing.T, src *fakeSource, st *fakeStore) *Poller {
 	t.Helper()
-	p := New(ctx, src, st, kafka.DescribeOptions{}, SkewPolicy{SharePct: 60}, time.Minute, discardLog())
+	p := New(ctx, "default", src, st, kafka.DescribeOptions{}, SkewPolicy{SharePct: 60}, time.Minute, discardLog())
 	p.now = func() time.Time { return testNow }
 	return p
 }

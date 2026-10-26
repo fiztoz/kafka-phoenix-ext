@@ -51,12 +51,26 @@ func (s *SQLite) Migrate(ctx context.Context) error {
 	return Migrate(ctx, s.db, s.migrations)
 }
 
+func (s *SQLite) Scoped(cluster string) Scoped {
+	return &sqliteScoped{db: s.db, cluster: cluster}
+}
+
+func (s *SQLite) Close() error { return s.db.Close() }
+
+// sqliteScoped is the per-cluster SQLite view.
+type sqliteScoped struct {
+	db      *sql.DB
+	cluster string
+}
+
+func (s *sqliteScoped) Cluster() string { return s.cluster }
+
 const upsertStateSQLite = `
 INSERT INTO ext_kafka_usage_topic_state
-  (topic, partitions, storage_bytes, prev_bytes,
+  (cluster, topic, partitions, storage_bytes, prev_bytes,
    polled_at, prev_polled_at, over_streak, confirmed_over, last_error)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(topic) DO UPDATE SET
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(cluster, topic) DO UPDATE SET
   partitions = excluded.partitions,
   storage_bytes = excluded.storage_bytes,
   prev_bytes = excluded.prev_bytes,
@@ -66,50 +80,48 @@ ON CONFLICT(topic) DO UPDATE SET
   confirmed_over = excluded.confirmed_over,
   last_error = excluded.last_error`
 
-func (s *SQLite) UpsertStates(ctx context.Context, rows []StateRow) error {
+func (s *sqliteScoped) UpsertStates(ctx context.Context, rows []StateRow) error {
 	for _, r := range rows {
 		if _, err := s.db.ExecContext(ctx, upsertStateSQLite,
-			r.Topic, r.Partitions, r.StorageBytes, r.PrevBytes,
+			s.cluster, r.Topic, r.Partitions, r.StorageBytes, r.PrevBytes,
 			bindUTC(r.PolledAt), bindNullUTC(r.PrevPolledAt),
 			r.OverStreak, r.ConfirmedOver, nullString(r.LastError),
 		); err != nil {
-			return fmt.Errorf("store: upsert state %s: %w", r.Topic, err)
+			return fmt.Errorf("store: upsert state %s/%s: %w", s.cluster, r.Topic, err)
 		}
 	}
 	return nil
 }
 
-func (s *SQLite) States(ctx context.Context) ([]StateRow, error) {
-	return queryStates(ctx, s.db)
+func (s *sqliteScoped) States(ctx context.Context) ([]StateRow, error) {
+	return queryStates(ctx, s.db, s.cluster)
 }
 
-func (s *SQLite) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error {
+func (s *sqliteScoped) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO ext_kafka_usage_thresholds (topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at)
-VALUES (?, ?, ?, ?, datetime('now'))
-ON CONFLICT(topic) DO UPDATE SET
+INSERT INTO ext_kafka_usage_thresholds (cluster, topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at)
+VALUES (?, ?, ?, ?, ?, datetime('now'))
+ON CONFLICT(cluster, topic) DO UPDATE SET
   threshold_bytes = excluded.threshold_bytes,
   warn_bytes = excluded.warn_bytes,
   growth_bytes_per_hour = excluded.growth_bytes_per_hour,
   updated_at = excluded.updated_at`,
-		topic, thresholdBytes, warnBytes, growthPerHour)
+		s.cluster, topic, thresholdBytes, warnBytes, growthPerHour)
 	if err != nil {
-		return fmt.Errorf("store: set threshold %s: %w", topic, err)
+		return fmt.Errorf("store: set threshold %s/%s: %w", s.cluster, topic, err)
 	}
 	return nil
 }
 
-func (s *SQLite) DeleteThreshold(ctx context.Context, topic string) error {
+func (s *sqliteScoped) DeleteThreshold(ctx context.Context, topic string) error {
 	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM ext_kafka_usage_thresholds WHERE topic = ?`, topic)
+		`DELETE FROM ext_kafka_usage_thresholds WHERE cluster = ? AND topic = ?`, s.cluster, topic)
 	if err != nil {
-		return fmt.Errorf("store: delete threshold %s: %w", topic, err)
+		return fmt.Errorf("store: delete threshold %s/%s: %w", s.cluster, topic, err)
 	}
 	return nil
 }
 
-func (s *SQLite) Thresholds(ctx context.Context) (map[string]ThresholdRow, error) {
-	return queryThresholds(ctx, s.db)
+func (s *sqliteScoped) Thresholds(ctx context.Context) (map[string]ThresholdRow, error) {
+	return queryThresholds(ctx, s.db, s.cluster)
 }
-
-func (s *SQLite) Close() error { return s.db.Close() }

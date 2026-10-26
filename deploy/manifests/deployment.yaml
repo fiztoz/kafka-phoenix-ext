@@ -1,5 +1,5 @@
 # kafka-phoenix-ext Deployment — separate pod, never a Phoenix sidecar.
-# Adjust namespace, image tag, KAFKA_BROKERS and resource values before
+# Adjust namespace, image tag, Kafka cluster env and resource values before
 # applying. Expected secrets:
 #   kafka-phoenix-ext    (key sasl-password)
 #   kafka-phoenix-ext-db (key dsn)
@@ -33,6 +33,10 @@ spec:
             - containerPort: 8080
               name: http
           env:
+            # Single cluster (the default layout). To poll several, replace
+            # KAFKA_BROKERS with KAFKA_CLUSTERS=<id,id> plus one
+            # KAFKA_<ID>_BROKERS per cluster; the shared KAFKA_SASL_*/TLS_*
+            # values below are inherited by every cluster.
             - name: KAFKA_BROKERS
               value: "kafka-0.kafka.svc:9092,kafka-1.kafka.svc:9092,kafka-2.kafka.svc:9092"
             # none | plain | scram-sha-256 | scram-sha-512

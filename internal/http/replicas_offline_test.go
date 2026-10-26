@@ -41,7 +41,7 @@ func TestMetadataOnlyOfflineReplicasConfirmedByHandler(t *testing.T) {
 	}
 
 	st := newFakeStore()
-	p := poller.New(context.Background(), aggSource{snap: described}, st, kafka.DescribeOptions{}, poller.SkewPolicy{}, time.Minute, slog.New(slog.DiscardHandler))
+	p := poller.New(context.Background(), "default", aggSource{snap: described}, st, kafka.DescribeOptions{}, poller.SkewPolicy{}, time.Minute, slog.New(slog.DiscardHandler))
 	for i := 0; i < 3; i++ {
 		p.PollOnce(context.Background())
 	}
@@ -51,10 +51,10 @@ func TestMetadataOnlyOfflineReplicasConfirmedByHandler(t *testing.T) {
 	}
 
 	srv, err := New(Deps{
-		BasePath:  "/kafka",
-		Snapshots: p,
-		Store:     st,
-		Log:       slog.New(slog.DiscardHandler),
+		BasePath: "/kafka",
+		Clusters: poller.NewManager(time.Minute, p),
+		Store:    st,
+		Log:      slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatal(err)

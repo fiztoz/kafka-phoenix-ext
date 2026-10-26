@@ -58,10 +58,10 @@ func TestGrantsProvisionRestrictedUser(t *testing.T) {
 		t.Fatalf("restricted migrate: %v", err)
 	}
 	now := time.Now().UTC()
-	if err := s.UpsertStates(ctx, []StateRow{{Topic: "orders", Partitions: 1, StorageBytes: 5, PolledAt: now}}); err != nil {
+	if err := s.Scoped("default").UpsertStates(ctx, []StateRow{{Topic: "orders", Partitions: 1, StorageBytes: 5, PolledAt: now}}); err != nil {
 		t.Fatalf("restricted state write: %v", err)
 	}
-	if err := s.SetThreshold(ctx, "orders", 9, nil, nil); err != nil {
+	if err := s.Scoped("default").SetThreshold(ctx, "orders", 9, nil, nil); err != nil {
 		t.Fatalf("restricted threshold write: %v", err)
 	}
 

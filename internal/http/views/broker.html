@@ -22,6 +22,7 @@
     <a class="btn" href="{{path .BasePath "/wallboard"}}">Wallboard</a>
   </div>
 </header>
+{{template "clusternav" .}}
 
 <div class="cards">
   <div class="card"><div class="k">Storage on broker</div><div class="v accent">{{bytes .Broker.Bytes}}</div><div class="d">all copies in its log dirs</div></div>

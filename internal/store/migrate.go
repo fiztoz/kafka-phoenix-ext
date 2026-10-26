@@ -37,32 +37,87 @@ func Migrate(ctx context.Context, db *sql.DB, migrations fs.FS) error {
 		engine  string
 	}
 	all := []migration{
-		{1, "migrations/001_init.up.sql", ""},
-		{2, "migrations/002_growth_threshold.up.sql", ""},
-		{3, "migrations/003_topic_collation.up.sql", "mariadb"},
+		{version: 1, file: "migrations/001_init.up.sql"},
+		{version: 2, file: "migrations/002_growth_threshold.up.sql"},
+		{version: 3, file: "migrations/003_topic_collation.up.sql", engine: "mariadb"},
+		{version: 4, file: "migrations/004_cluster_scope.up.sql", engine: "mariadb"},
+		{version: 5, file: "migrations/005_cluster_scope_sqlite.up.sql", engine: "sqlite"},
 	}
 	engine := schemaEngine(ctx, db)
 	for _, m := range all {
 		if current >= m.version {
 			continue
 		}
+		var body string
 		if m.engine == "" || m.engine == engine {
 			sqlBytes, err := fs.ReadFile(migrations, m.file)
 			if err != nil {
 				return fmt.Errorf("store: read %s: %w", m.file, err)
 			}
-			if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
-				return fmt.Errorf("store: apply %s: %w", m.file, err)
-			}
+			body = string(sqlBytes)
 		}
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO `+schemaTable+` (version, applied_at) VALUES (?, ?)`,
-			m.version, time.Now().UTC(),
-		); err != nil {
-			return fmt.Errorf("store: record schema version %d: %w", m.version, err)
+		if err := applyMigration(ctx, db, body, engine == "sqlite", m.version); err != nil {
+			return fmt.Errorf("store: apply %s: %w", m.file, err)
 		}
 	}
 	return nil
+}
+
+// SQLite DDL and its version record commit together. A failure (including
+// cancellation or a failed version INSERT) rolls back the entire rebuild.
+// MariaDB DDL implicitly commits, so those SQL files must be replay-safe.
+func applyMigration(ctx context.Context, db *sql.DB, body string, sqlite bool, version int) error {
+	if sqlite {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for _, stmt := range splitStatements(body) {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		if err := recordMigration(ctx, tx, version); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if body != "" {
+		if _, err := db.ExecContext(ctx, body); err != nil {
+			return err
+		}
+	}
+	return recordMigration(ctx, db, version)
+}
+
+func recordMigration(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, version int) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO `+schemaTable+` (version, applied_at) VALUES (?, ?)`,
+		version, time.Now().UTC())
+	return err
+}
+
+// splitStatements breaks a migration file into executable statements. It
+// drops full-line SQL comments and trailing semicolons. These files carry no
+// string literal containing a semicolon, so a plain split is faithful here.
+func splitStatements(body string) []string {
+	var kept []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	var out []string
+	for _, stmt := range strings.Split(strings.Join(kept, "\n"), ";") {
+		if s := strings.TrimSpace(stmt); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func schemaEngine(ctx context.Context, db *sql.DB) string {

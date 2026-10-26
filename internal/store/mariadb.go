@@ -52,11 +52,25 @@ func (m *MariaDB) Migrate(ctx context.Context) error {
 	return Migrate(ctx, m.db, m.migrations)
 }
 
+func (m *MariaDB) Scoped(cluster string) Scoped {
+	return &mariaScoped{db: m.db, cluster: cluster}
+}
+
+func (m *MariaDB) Close() error { return m.db.Close() }
+
+// mariaScoped is the per-cluster MariaDB view.
+type mariaScoped struct {
+	db      *sql.DB
+	cluster string
+}
+
+func (m *mariaScoped) Cluster() string { return m.cluster }
+
 const upsertStateMaria = `
 INSERT INTO ext_kafka_usage_topic_state
-  (topic, partitions, storage_bytes, prev_bytes,
+  (cluster, topic, partitions, storage_bytes, prev_bytes,
    polled_at, prev_polled_at, over_streak, confirmed_over, last_error)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
   partitions = VALUES(partitions),
   storage_bytes = VALUES(storage_bytes),
@@ -67,64 +81,63 @@ ON DUPLICATE KEY UPDATE
   confirmed_over = VALUES(confirmed_over),
   last_error = VALUES(last_error)`
 
-func (m *MariaDB) UpsertStates(ctx context.Context, rows []StateRow) error {
+func (m *mariaScoped) UpsertStates(ctx context.Context, rows []StateRow) error {
 	for _, r := range rows {
 		if _, err := m.db.ExecContext(ctx, upsertStateMaria,
-			r.Topic, r.Partitions, r.StorageBytes, r.PrevBytes,
+			m.cluster, r.Topic, r.Partitions, r.StorageBytes, r.PrevBytes,
 			bindUTC(r.PolledAt), bindNullUTC(r.PrevPolledAt),
 			r.OverStreak, r.ConfirmedOver, nullString(r.LastError),
 		); err != nil {
-			return fmt.Errorf("store: upsert state %s: %w", r.Topic, err)
+			return fmt.Errorf("store: upsert state %s/%s: %w", m.cluster, r.Topic, err)
 		}
 	}
 	return nil
 }
 
 const selectStates = `
-SELECT topic, partitions, storage_bytes, prev_bytes,
+SELECT cluster, topic, partitions, storage_bytes, prev_bytes,
        polled_at, prev_polled_at, over_streak, confirmed_over,
        COALESCE(last_error, '')
-FROM ext_kafka_usage_topic_state`
+FROM ext_kafka_usage_topic_state
+WHERE cluster = ?`
 
-func (m *MariaDB) States(ctx context.Context) ([]StateRow, error) {
-	return queryStates(ctx, m.db)
+func (m *mariaScoped) States(ctx context.Context) ([]StateRow, error) {
+	return queryStates(ctx, m.db, m.cluster)
 }
 
-func (m *MariaDB) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error {
+func (m *mariaScoped) SetThreshold(ctx context.Context, topic string, thresholdBytes int64, warnBytes, growthPerHour *int64) error {
 	_, err := m.db.ExecContext(ctx, `
-INSERT INTO ext_kafka_usage_thresholds (topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO ext_kafka_usage_thresholds (cluster, topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
   threshold_bytes = VALUES(threshold_bytes),
   warn_bytes = VALUES(warn_bytes),
   growth_bytes_per_hour = VALUES(growth_bytes_per_hour),
   updated_at = VALUES(updated_at)`,
-		topic, thresholdBytes, warnBytes, growthPerHour, time.Now().UTC())
+		m.cluster, topic, thresholdBytes, warnBytes, growthPerHour, time.Now().UTC())
 	if err != nil {
-		return fmt.Errorf("store: set threshold %s: %w", topic, err)
+		return fmt.Errorf("store: set threshold %s/%s: %w", m.cluster, topic, err)
 	}
 	return nil
 }
 
-func (m *MariaDB) DeleteThreshold(ctx context.Context, topic string) error {
+func (m *mariaScoped) DeleteThreshold(ctx context.Context, topic string) error {
 	_, err := m.db.ExecContext(ctx,
-		`DELETE FROM ext_kafka_usage_thresholds WHERE topic = ?`, topic)
+		`DELETE FROM ext_kafka_usage_thresholds WHERE cluster = ? AND topic = ?`, m.cluster, topic)
 	if err != nil {
-		return fmt.Errorf("store: delete threshold %s: %w", topic, err)
+		return fmt.Errorf("store: delete threshold %s/%s: %w", m.cluster, topic, err)
 	}
 	return nil
 }
 
-func (m *MariaDB) Thresholds(ctx context.Context) (map[string]ThresholdRow, error) {
-	return queryThresholds(ctx, m.db)
+func (m *mariaScoped) Thresholds(ctx context.Context) (map[string]ThresholdRow, error) {
+	return queryThresholds(ctx, m.db, m.cluster)
 }
-
-func (m *MariaDB) Close() error { return m.db.Close() }
 
 // --- shared query helpers ---
 
-func queryStates(ctx context.Context, db *sql.DB) ([]StateRow, error) {
-	rows, err := db.QueryContext(ctx, selectStates)
+func queryStates(ctx context.Context, db *sql.DB, cluster string) ([]StateRow, error) {
+	rows, err := db.QueryContext(ctx, selectStates, cluster)
 	if err != nil {
 		return nil, fmt.Errorf("store: query states: %w", err)
 	}
@@ -134,7 +147,7 @@ func queryStates(ctx context.Context, db *sql.DB) ([]StateRow, error) {
 		var r StateRow
 		var polled, prevPolled any
 		var confirmed int
-		if err := rows.Scan(&r.Topic, &r.Partitions, &r.StorageBytes, &r.PrevBytes,
+		if err := rows.Scan(&r.Cluster, &r.Topic, &r.Partitions, &r.StorageBytes, &r.PrevBytes,
 			&polled, &prevPolled, &r.OverStreak, &confirmed, &r.LastError); err != nil {
 			return nil, fmt.Errorf("store: scan state: %w", err)
 		}
@@ -154,9 +167,10 @@ func queryStates(ctx context.Context, db *sql.DB) ([]StateRow, error) {
 	return out, rows.Err()
 }
 
-func queryThresholds(ctx context.Context, db *sql.DB) (map[string]ThresholdRow, error) {
+func queryThresholds(ctx context.Context, db *sql.DB, cluster string) (map[string]ThresholdRow, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at FROM ext_kafka_usage_thresholds`)
+		`SELECT cluster, topic, threshold_bytes, warn_bytes, growth_bytes_per_hour, updated_at
+		   FROM ext_kafka_usage_thresholds WHERE cluster = ?`, cluster)
 	if err != nil {
 		return nil, fmt.Errorf("store: query thresholds: %w", err)
 	}
@@ -166,7 +180,7 @@ func queryThresholds(ctx context.Context, db *sql.DB) (map[string]ThresholdRow, 
 		var q ThresholdRow
 		var warn, growth any
 		var updated any
-		if err := rows.Scan(&q.Topic, &q.ThresholdBytes, &warn, &growth, &updated); err != nil {
+		if err := rows.Scan(&q.Cluster, &q.Topic, &q.ThresholdBytes, &warn, &growth, &updated); err != nil {
 			return nil, fmt.Errorf("store: scan threshold: %w", err)
 		}
 		q.WarnBytes = scanNullableInt(warn)

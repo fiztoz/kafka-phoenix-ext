@@ -61,6 +61,9 @@ type TopicView struct {
 
 // Snapshot is the poller's last observation.
 type Snapshot struct {
+	// Cluster is the configured cluster id this snapshot belongs to (the
+	// id from KAFKA_CLUSTERS), not the Kafka-reported cluster id below.
+	Cluster      string
 	ClusterID    string
 	ControllerID int32
 	PolledAt     time.Time // zero until the first successful poll
@@ -108,9 +111,11 @@ type prevSample struct {
 }
 
 // Poller polls Kafka log dirs on an interval and maintains hysteresis state.
+// One Poller observes exactly one cluster; a Manager owns the set of them.
 type Poller struct {
+	cluster  string
 	source   Source
-	store    store.Store
+	store    store.Scoped
 	opts     kafka.DescribeOptions
 	skew     SkewPolicy
 	interval time.Duration
@@ -130,10 +135,12 @@ type Poller struct {
 	thresholds  map[string]store.ThresholdRow
 }
 
-// New builds a Poller. The snapshot is seeded from durable store state so a
-// restart does not forget a confirmed over-threshold or the growth baseline.
-func New(ctx context.Context, source Source, st store.Store, opts kafka.DescribeOptions, skew SkewPolicy, interval time.Duration, log *slog.Logger) *Poller {
+// New builds a Poller for one cluster. The snapshot is seeded from durable
+// store state so a restart does not forget a confirmed over-threshold or the
+// growth baseline. st must be the store scope bound to the same cluster id.
+func New(ctx context.Context, cluster string, source Source, st store.Scoped, opts kafka.DescribeOptions, skew SkewPolicy, interval time.Duration, log *slog.Logger) *Poller {
 	p := &Poller{
+		cluster:     cluster,
 		source:      source,
 		store:       st,
 		opts:        opts,
@@ -141,7 +148,7 @@ func New(ctx context.Context, source Source, st store.Store, opts kafka.Describe
 		interval:    interval,
 		log:         log,
 		now:         time.Now,
-		snap:        Snapshot{PollOK: false, ControllerID: -1, SkewBrokerID: -1},
+		snap:        Snapshot{Cluster: cluster, PollOK: false, ControllerID: -1, SkewBrokerID: -1},
 		prev:        map[string]prevSample{},
 		windows:     map[string][]prevSample{},
 		streaks:     map[string]int{},
@@ -198,6 +205,9 @@ func topicViewFromState(r store.StateRow) TopicView {
 	return tv
 }
 
+// Cluster reports the configured cluster id this poller observes.
+func (p *Poller) Cluster() string { return p.cluster }
+
 // Run polls immediately, then every interval until ctx is done.
 func (p *Poller) Run(ctx context.Context) {
 	p.tick(ctx)
@@ -236,7 +246,7 @@ func (p *Poller) tick(ctx context.Context) {
 		p.snap.PollOK = false
 		p.snap.LastError = fmt.Sprintf("describe: %v", err)
 		p.mu.Unlock()
-		p.log.Warn("poller: describe failed; keeping last good sample", "err", err)
+		p.log.Warn("poller: describe failed; keeping last good sample", "cluster", p.cluster, "err", err)
 		return
 	}
 
@@ -256,7 +266,7 @@ func (p *Poller) tick(ctx context.Context) {
 
 	if described.SizeIncomplete {
 		p.log.Warn("poller: incomplete size observation; preserving alarms and growth baseline",
-			"errors", described.BrokerErrors)
+			"cluster", p.cluster, "errors", described.BrokerErrors)
 		return
 	}
 	if err := p.store.UpsertStates(ctx, rows); err != nil {
@@ -265,7 +275,7 @@ func (p *Poller) tick(ctx context.Context) {
 		p.mu.Lock()
 		p.snap.StorageError = fmt.Sprintf("persist: %v", err)
 		p.mu.Unlock()
-		p.log.Error("poller: could not persist states", "err", err)
+		p.log.Error("poller: could not persist states", "cluster", p.cluster, "err", err)
 		return
 	}
 	p.mu.Lock()

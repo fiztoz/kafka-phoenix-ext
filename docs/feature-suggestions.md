@@ -10,9 +10,18 @@ The **Lag** column on `/topic/{name}` today is **replica log lag** from
 
 ---
 
-## Status (2026-09)
+## Status (2026-10)
 
 Shipped (no extra ACLs needed):
+
+- **Multi-cluster polling.** `KAFKA_CLUSTERS` + `KAFKA_<ID>_*`; one poller
+  per cluster, `(cluster, topic)` storage keys, `/c/{cluster}/` pages,
+  per-cluster `/health/c/{cluster}/*` monitors and `/health/clusters`
+  aggregate. A single-cluster install keeps its flat URLs and its
+  `default`-labelled rows. Not a new feature area: it removes the "one
+  cluster per extension instance, one database per copy" limitation, and it
+  makes the consumer-group work in #1 decide *which* cluster's groups.
+
 
 - **#2** `/health/replicas` with 2-poll hysteresis; wallboard/dashboard badge it.
 - **#3** `/health/brokers` + hottest-broker share on dashboard/wallboard

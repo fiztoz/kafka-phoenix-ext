@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fiztoz/kafka-phoenix-ext/internal/poller"
@@ -12,9 +13,27 @@ import (
 
 // --- page data ---
 
+// clusterLink is one entry in the cluster switcher.
+type clusterLink struct {
+	ID         string
+	URL        string
+	Active     bool
+	PollOK     bool
+	Alerts     int // confirmed over-threshold / replica / growth / skew
+	Topics     int
+	TotalBytes int64
+}
+
+// pageData is the template payload for a single cluster's pages. BasePath is
+// already cluster-scoped ("/kafka/c/harbor"), so the existing templates build
+// correct links without knowing about multi-cluster routing.
 type pageData struct {
 	BasePath     string
-	ClusterID    string
+	Cluster      string // configured cluster id, e.g. "harbor"
+	ClusterID    string // Kafka-reported cluster id
+	Clusters     []clusterLink
+	OverviewURL  string
+	Multi        bool // more than one cluster is polled
 	ControllerID int32
 	Brokers      []apiBroker
 	BrokerErrors []string
@@ -34,10 +53,155 @@ type pageData struct {
 	TotalBrokerBytes int64
 }
 
+// clusterBase is the URL prefix for one cluster's pages.
+//
+// A single-cluster install keeps the original flat URLs (/kafka/topic/x): no
+// Ingress rule, bookmark or Phoenix monitor has to change just because the
+// code learned about clusters. The /c/{cluster}/ routes still resolve, so a
+// bookmark taken from a multi-cluster install keeps working.
+func (s *Server) clusterBase(cluster string) string {
+	if ids := s.deps.Clusters.Clusters(); len(ids) <= 1 {
+		return JoinPath(s.deps.BasePath, "/")
+	}
+	return JoinPath(s.deps.BasePath, "/c/"+cluster)
+}
+
+// overviewBase is the landing page that lists every cluster.
+func (s *Server) overviewBase() string { return JoinPath(s.deps.BasePath, "/") }
+
+// clusterLinks builds the switcher, flagging the active cluster.
+func (s *Server) clusterLinks(active string) []clusterLink {
+	ids := s.deps.Clusters.Clusters()
+	out := make([]clusterLink, 0, len(ids))
+	for _, id := range ids {
+		snap, ok := s.deps.Clusters.Snapshot(id)
+		link := clusterLink{
+			ID:         id,
+			URL:        s.clusterBase(id),
+			Active:     id == active,
+			PollOK:     ok && snap.PollOK,
+			Topics:     len(snap.Topics),
+			TotalBytes: snap.TotalBytes,
+			Alerts:     confirmedAlerts(snap),
+		}
+		out = append(out, link)
+	}
+	return out
+}
+
+// confirmedAlerts counts topics and policies that are confirmed bad, using the
+// same hysteresis the health endpoints use.
+func confirmedAlerts(snap poller.Snapshot) int {
+	n := 0
+	if snap.SkewConfirmed {
+		n++
+	}
+	for _, t := range snap.Topics {
+		if t.ConfirmedOver || t.ReplicaConfirmed || t.GrowthConfirmed {
+			n++
+		}
+	}
+	return n
+}
+
+// --- landing ---
+
+// handleLanding serves the single cluster's dashboard when one cluster is
+// polled, and the cluster overview otherwise. A single-cluster install keeps
+// its old landing page unchanged.
+func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
+	ids := s.deps.Clusters.Clusters()
+	if len(ids) <= 1 {
+		cluster := s.deps.LegacyCluster
+		if len(ids) == 1 {
+			cluster = ids[0]
+		}
+		s.handleDashboard(w, r, cluster)
+		return
+	}
+	if strings.TrimSuffix(r.URL.Path, "/") != strings.TrimSuffix(s.overviewBase(), "/") {
+		// Anything else under the root prefix is not a page we serve.
+		http.NotFound(w, r)
+		return
+	}
+	s.render(w, "overview.html", s.overviewData())
+}
+
+// overviewCard summarises one cluster on the landing page.
+type overviewCard struct {
+	ID         string
+	URL        string
+	ClusterID  string // Kafka-reported id
+	PollOK     bool
+	ErrKind    string
+	LastError  string
+	Brokers    int
+	Topics     int
+	TotalBytes int64
+	PolledAt   time.Time
+	Confirmed  int // confirmed alerts
+	Warn       int // topics past their warn level but not confirmed over
+	Stale      bool
+}
+
+type overviewPage struct {
+	BasePath     string
+	Cards        []overviewCard
+	TotalBytes   int64
+	TotalTopics  int
+	TotalBrokers int
+	Down         int
+	Confirmed    int
+}
+
+func (s *Server) overviewData() overviewPage {
+	ids := s.deps.Clusters.Clusters()
+	page := overviewPage{
+		BasePath: s.deps.BasePath,
+		Cards:    make([]overviewCard, 0, len(ids)),
+	}
+	for _, id := range ids {
+		snap, _ := s.deps.Clusters.Snapshot(id)
+		card := overviewCard{
+			ID:         id,
+			URL:        s.clusterBase(id),
+			ClusterID:  snap.ClusterID,
+			PollOK:     snap.PollOK,
+			LastError:  snap.LastError,
+			Brokers:    len(snap.Brokers),
+			Topics:     len(snap.Topics),
+			TotalBytes: snap.TotalBytes,
+			PolledAt:   snap.PolledAt,
+			Confirmed:  confirmedAlerts(snap),
+			Stale:      snap.PollOK && time.Since(snap.PolledAt) > s.deps.Clusters.StaleThreshold(),
+		}
+		if !snap.PollOK {
+			card.ErrKind = string(classifyErr(snap.LastError))
+			page.Down++
+		}
+		for _, t := range snap.Topics {
+			if t.WarnBytes != nil && t.StorageBytes >= numValue(t.WarnBytes) && !t.ConfirmedOver {
+				card.Warn++
+			}
+		}
+		page.Confirmed += card.Confirmed
+		page.TotalBytes += card.TotalBytes
+		page.TotalTopics += card.Topics
+		page.TotalBrokers += card.Brokers
+		page.Cards = append(page.Cards, card)
+	}
+	return page
+}
+
 // --- dashboards ---
 
-func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	pd := s.dashboardData()
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
+	pd := s.dashboardData(cluster, snap)
 	pd.Sort = sortKey(r)
 	pd.Topics = sortTopics(pd.Topics, pd.Sort)
 	s.render(w, "dashboard.html", pd)
@@ -45,15 +209,24 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 // handleWallboard orders by severity first (confirmed problems on top),
 // then size: a wallboard earns its keep when the red tiles sit together.
-func (s *Server) handleWallboard(w http.ResponseWriter, _ *http.Request) {
-	pd := s.dashboardData()
+func (s *Server) handleWallboard(w http.ResponseWriter, r *http.Request, cluster string) {
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
+	pd := s.dashboardData(cluster, snap)
 	pd.Topics = wallboardOrder(pd.Topics)
 	s.render(w, "wallboard.html", pd)
 }
 
-func (s *Server) handleTopicPage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTopicPage(w http.ResponseWriter, r *http.Request, cluster string) {
 	name := r.PathValue("name")
-	snap := s.deps.Snapshots.Snapshot()
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	var topic *poller.TopicView
 	for i := range snap.Topics {
 		if snap.Topics[i].Name == name {
@@ -70,7 +243,7 @@ func (s *Server) handleTopicPage(w http.ResponseWriter, r *http.Request) {
 		pageData
 		Topic *poller.TopicView
 	}{
-		pageData: s.dashboardData(),
+		pageData: s.dashboardData(cluster, snap),
 		Topic:    topic,
 	}
 	s.render(w, "topic.html", data)
@@ -94,13 +267,17 @@ type leaderPartitionRow struct {
 // handleBrokerPage renders the per-broker drill-down (#9): what the broker
 // holds, computed from the same DescribeLogDirs + Metadata payload the
 // poller already paid for. No extra Kafka calls.
-func (s *Server) handleBrokerPage(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 32)
+func (s *Server) handleBrokerPage(w http.ResponseWriter, r *http.Request, cluster string) {
+	id, err := strconv.ParseInt(r.PathValue("broker"), 10, 32)
 	if err != nil {
 		http.Error(w, "unknown broker", http.StatusNotFound)
 		return
 	}
-	snap := s.deps.Snapshots.Snapshot()
+	snap, ok := s.deps.Clusters.Snapshot(cluster)
+	if !ok {
+		http.Error(w, "unknown cluster", http.StatusNotFound)
+		return
+	}
 	var broker *apiBroker
 	var totalBrokerBytes int64
 	for _, b := range snap.Brokers {
@@ -182,7 +359,7 @@ func (s *Server) handleBrokerPage(w http.ResponseWriter, r *http.Request) {
 		LeaderBytes     int64
 		LeaderTruncated bool
 	}{
-		pageData:        s.dashboardData(),
+		pageData:        s.dashboardData(cluster, snap),
 		Broker:          *broker,
 		Share:           share,
 		Hosted:          hostedRows,
@@ -201,12 +378,16 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 	}
 }
 
-// dashboardData assembles the template payload.
-func (s *Server) dashboardData() pageData {
-	snap := s.deps.Snapshots.Snapshot()
+// dashboardData assembles the template payload for one cluster.
+func (s *Server) dashboardData(cluster string, snap poller.Snapshot) pageData {
+	ids := s.deps.Clusters.Clusters()
 	pd := pageData{
-		BasePath:     s.deps.BasePath,
+		BasePath:     s.clusterBase(cluster),
+		Cluster:      cluster,
 		ClusterID:    snap.ClusterID,
+		Clusters:     s.clusterLinks(cluster),
+		OverviewURL:  s.overviewBase(),
+		Multi:        len(ids) > 1,
 		ControllerID: snap.ControllerID,
 		BrokerErrors: snap.BrokerErrors,
 		PolledAt:     snap.PolledAt,
@@ -307,10 +488,10 @@ func wallboardOrder(ts []poller.TopicView) []poller.TopicView {
 // --- threshold forms ---
 
 // handleThresholdForm accepts a plain HTML form post (topic page actions)
-// and redirects back to the dashboard.
-func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
+// and redirects back to the cluster dashboard.
+func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request, cluster string) {
 	redirect := func() {
-		http.Redirect(w, r, JoinPath(s.deps.BasePath, "/"), http.StatusSeeOther)
+		http.Redirect(w, r, JoinPath(s.clusterBase(cluster), "/"), http.StatusSeeOther)
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
@@ -340,7 +521,7 @@ func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
 		}
 		growth = &v
 	}
-	if err := s.setThreshold(r, thresholdRequest{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, GrowthPerHour: growth}); err != nil {
+	if err := s.setThreshold(r, cluster, thresholdRequest{Topic: topic, ThresholdBytes: limit, WarnBytes: warn, GrowthPerHour: growth}); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -348,9 +529,9 @@ func (s *Server) handleThresholdForm(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleThresholdDeleteForm removes a threshold from the UI.
-func (s *Server) handleThresholdDeleteForm(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleThresholdDeleteForm(w http.ResponseWriter, r *http.Request, cluster string) {
 	redirect := func() {
-		http.Redirect(w, r, JoinPath(s.deps.BasePath, "/"), http.StatusSeeOther)
+		http.Redirect(w, r, JoinPath(s.clusterBase(cluster), "/"), http.StatusSeeOther)
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
@@ -361,11 +542,11 @@ func (s *Server) handleThresholdDeleteForm(w http.ResponseWriter, r *http.Reques
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.deps.Store.DeleteThreshold(r.Context(), topic); err != nil {
+	if err := s.deps.Store.Scoped(cluster).DeleteThreshold(r.Context(), topic); err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	s.refreshThresholds(r)
+	s.refreshThresholds(r, cluster)
 	redirect()
 }
 

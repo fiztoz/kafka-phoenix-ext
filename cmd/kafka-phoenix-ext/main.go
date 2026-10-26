@@ -1,7 +1,7 @@
 // Command kafka-phoenix-ext is the Uptime Phoenix Kafka extension: it polls
-// cluster log-dir sizes via the Kafka admin protocol, renders a per-topic
-// storage dashboard/wallboard, and exposes /health/ready + /health/thresholds
-// for Phoenix HTTP monitors.
+// one or more Kafka clusters' log-dir sizes via the Kafka admin protocol,
+// renders a per-topic storage dashboard/wallboard, and exposes per-cluster
+// /health/* endpoints for Phoenix HTTP monitors.
 package main
 
 import (
@@ -17,6 +17,7 @@ import (
 
 	kafkaext "github.com/fiztoz/kafka-phoenix-ext"
 	"github.com/fiztoz/kafka-phoenix-ext/internal/config"
+	"github.com/fiztoz/kafka-phoenix-ext/internal/kafka"
 	"github.com/fiztoz/kafka-phoenix-ext/internal/poller"
 	"github.com/fiztoz/kafka-phoenix-ext/internal/store"
 )
@@ -53,24 +54,41 @@ func run() error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	client, err := newKafkaClient(cfg, log)
-	if err != nil {
+	if err := validateLegacyScope(ctx, cfg, st); err != nil {
 		_ = st.Close()
 		return err
 	}
 
-	// Kafka may be down at startup: never crash-loop for that. HTTP comes up,
-	// /health/live is 200 and /health/ready is 503 until a poll succeeds.
-	p := poller.New(ctx, client, st, pollerOptions(cfg), poller.SkewPolicy{
-		SharePct: cfg.BrokerSkewPct,
-		MaxBytes: cfg.BrokerMaxBytes,
-	}, cfg.PollInterval, log)
-	go p.Run(ctx)
-
-	srv, err := newHTTPServer(cfg, p, st, log)
-	if err != nil {
+	// One admin client and one poller per cluster. A cluster that is
+	// unreachable at startup must not stop the others: the poller keeps the
+	// last good sample and /health/c/{cluster}/ready reports 503 for it alone.
+	clients := make([]*kafka.Client, 0, len(cfg.Clusters))
+	pollers := make([]*poller.Poller, 0, len(cfg.Clusters))
+	closeAll := func() {
+		for _, c := range clients {
+			c.Close()
+		}
 		_ = st.Close()
-		client.Close()
+	}
+	for _, cluster := range cfg.Clusters {
+		client, err := newKafkaClient(cluster, cfg.KafkaTimeout, log)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("cluster %s: %w", cluster.ID, err)
+		}
+		clients = append(clients, client)
+		pollers = append(pollers, poller.New(ctx, cluster.ID, client, st.Scoped(cluster.ID),
+			pollerOptions(cluster), poller.SkewPolicy{
+				SharePct: cfg.BrokerSkewPct,
+				MaxBytes: cfg.BrokerMaxBytes,
+			}, cfg.PollInterval, log))
+	}
+	manager := poller.NewManager(cfg.PollInterval, pollers...)
+	go manager.Run(ctx)
+
+	srv, err := newHTTPServer(cfg, manager, st, log)
+	if err != nil {
+		closeAll()
 		return err
 	}
 
@@ -81,7 +99,9 @@ func run() error {
 	}
 	httpErr := make(chan error, 1)
 	go func() {
-		log.Info("kafka-phoenix-ext listening", "addr", cfg.ListenAddr, "base_path", cfg.BasePath)
+		log.Info("kafka-phoenix-ext listening", "addr", cfg.ListenAddr,
+			"base_path", cfg.BasePath, "clusters", manager.Clusters(),
+			"legacy_cluster", cfg.LegacyCluster)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			httpErr <- err
 		}
@@ -90,23 +110,25 @@ func run() error {
 	select {
 	case err := <-httpErr:
 		stop()
-		shutdown(httpServer, client, st, log)
+		shutdown(httpServer, clients, st, log)
 		return fmt.Errorf("http: %w", err) // cannot bind: crash
 	case <-ctx.Done():
 	}
 
-	shutdown(httpServer, client, st, log)
+	shutdown(httpServer, clients, st, log)
 	log.Info("kafka-phoenix-ext stopped")
 	return nil
 }
 
-func shutdown(httpServer *http.Server, client interface{ Close() }, st store.Store, log *slog.Logger) {
+func shutdown(httpServer *http.Server, clients []*kafka.Client, st store.Store, log *slog.Logger) {
 	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := httpServer.Shutdown(shCtx); err != nil {
 		log.Warn("http shutdown", "err", err)
 	}
 	cancel()
-	client.Close()
+	for _, c := range clients {
+		c.Close()
+	}
 	if err := st.Close(); err != nil {
 		log.Warn("store close", "err", err)
 	}

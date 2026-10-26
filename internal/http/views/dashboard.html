@@ -27,6 +27,7 @@
     <a class="btn btn-solid" href="{{path .BasePath "/wallboard"}}">Wallboard</a>
   </div>
 </header>
+{{template "clusternav" .}}
 
 {{if not .PollOK}}
 <div class="banner bad">

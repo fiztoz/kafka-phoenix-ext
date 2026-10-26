@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Kafka Clusters</title>
+{{template "styles" .}}
+</head>
+<body>
+<div class="wrap">
+<header class="topbar">
+  <div class="brand">
+    <h1>Kafka Clusters</h1>
+    <div class="sub">
+      <span>{{len .Cards}} clusters</span>
+      <span>{{.TotalTopics}} topics</span>
+      <span>{{.TotalBrokers}} brokers</span>
+      <span><b>{{bytes .TotalBytes}}</b> on disk</span>
+      {{if .Down}}<span class="pill bad">{{.Down}} not polling</span>{{else}}<span class="pill ok">all polling</span>{{end}}
+      {{if .Confirmed}}<span class="pill bad">{{.Confirmed}} confirmed alert{{if gt .Confirmed 1}}s{{end}}</span>{{end}}
+    </div>
+  </div>
+</header>
+
+<div class="grid">
+{{range .Cards}}
+  <a class="tile{{if not .PollOK}} alert{{else if .Confirmed}} alert{{else if or .Warn .Stale}} watch{{end}}" href="{{.URL}}">
+    <h2>{{.ID}}</h2>
+    <div class="size">{{bytes .TotalBytes}}</div>
+    <div class="dets">
+      <span>{{.Topics}} topics</span>
+      <span>{{.Brokers}} brokers</span>
+      <span>polled {{age .PolledAt}} ago</span>
+      {{if not .PollOK}}<span class="bad">poll failed</span>{{end}}
+      {{if .Confirmed}}<span class="bad">{{.Confirmed}} confirmed</span>{{end}}
+      {{if .Warn}}<span class="warn">{{.Warn}} near limit</span>{{end}}
+      {{if .Stale}}<span class="warn">stale</span>{{end}}
+      {{if .ClusterID}}<span>{{.ClusterID}}</span>{{end}}
+    </div>
+    {{if not .PollOK}}
+    <div class="dets">
+      <span class="bad">
+        {{if eq .ErrKind "auth"}}Missing ACLs{{else if eq .ErrKind "timeout"}}Poll timed out{{else}}Unreachable{{end}}
+      </span>
+    </div>
+    {{if .LastError}}<div class="dets"><span class="bad">{{.LastError}}</span></div>{{end}}
+    {{if eq .ErrKind "auth"}}<div class="dets"><span class="bad">Required: CLUSTER Describe, TOPIC Describe</span></div>{{end}}
+    {{end}}
+  </a>
+{{else}}
+  <div class="empty">No Kafka clusters configured.</div>
+{{end}}
+</div>
+
+<p class="foot">
+Each cluster keeps its own thresholds, growth window and hysteresis. Per-cluster
+monitors live at <code class="mono">/health/c/{cluster}/ready</code>,
+<code class="mono">/health/c/{cluster}/thresholds</code>,
+<code class="mono">/health/c/{cluster}/replicas</code>,
+<code class="mono">/health/c/{cluster}/growth</code> and
+<code class="mono">/health/c/{cluster}/brokers</code>.
+<code class="mono">/health/clusters</code> fails while any cluster cannot be polled.
+</p>
+</div>
+</body>
+</html>

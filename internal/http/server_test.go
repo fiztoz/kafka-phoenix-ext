@@ -28,11 +28,13 @@ func (f *fakeSnapshots) set(s poller.Snapshot) {
 	f.mu.Unlock()
 }
 
-func (f *fakeSnapshots) Snapshot() poller.Snapshot {
+func (f *fakeSnapshots) Snapshot(string) (poller.Snapshot, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.snap
+	return f.snap, true
 }
+
+func (f *fakeSnapshots) Clusters() []string { return []string{"default"} }
 
 func (f *fakeSnapshots) StaleThreshold() time.Duration { return 30 * time.Minute }
 
@@ -45,6 +47,11 @@ func newFakeStore() *fakeStore { return &fakeStore{thresholds: map[string]store.
 
 func (f *fakeStore) Migrate(context.Context) error { return nil }
 func (f *fakeStore) Close() error                  { return nil }
+
+// Scoped and Cluster make fakeStore both a store.Store and a store.Scoped.
+// The fake keeps one flat threshold map: tests here exercise one cluster.
+func (f *fakeStore) Scoped(string) store.Scoped { return f }
+func (f *fakeStore) Cluster() string            { return "default" }
 
 func (f *fakeStore) UpsertStates(context.Context, []store.StateRow) error { return nil }
 func (f *fakeStore) States(context.Context) ([]store.StateRow, error)     { return nil, nil }
@@ -83,11 +90,11 @@ func newTestServerAt(t *testing.T, snap poller.Snapshot, uiToken, base string) (
 	fs.set(snap)
 	st := newFakeStore()
 	srv, err := New(Deps{
-		BasePath:  base,
-		UIToken:   uiToken,
-		Snapshots: fs,
-		Store:     st,
-		Log:       slog.New(slog.DiscardHandler),
+		BasePath: base,
+		UIToken:  uiToken,
+		Clusters: fs,
+		Store:    st,
+		Log:      slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)

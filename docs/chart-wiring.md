@@ -18,6 +18,8 @@ extensions:
       secretName: kafka-phoenix-ext-db
       secretKey: dsn
     env:
+      # One cluster. Add KAFKA_CLUSTERS + per-cluster broker lists to poll
+      # several; see "Several clusters" below.
       - name: KAFKA_BROKERS
         value: "kafka-0.kafka.svc:9092,kafka-1.kafka.svc:9092,kafka-2.kafka.svc:9092"
       - name: KAFKA_SASL_MECHANISM
@@ -79,3 +81,67 @@ Point Phoenix HTTP monitors at:
 
 Storage pressure is growth, not an outage: it must not flip any producer
 heartbeat DOWN — use the thresholds endpoint for the alert body.
+
+## Several clusters
+
+One extension instance can poll several Kafka clusters: declare the ids and give
+each its own broker list. Per-cluster values fall back to the shared
+`KAFKA_*` block, so a shared principal only costs two extra lines. The names
+`harbor` and `summit` in this fresh-install example are fictional.
+
+**Existing installations:** keep the original cluster as `default`, rename
+its `KAFKA_BROKERS` variable to `KAFKA_DEFAULT_BROKERS` (same value), remove
+`KAFKA_BROKERS`, and use `KAFKA_CLUSTERS=default,summit`. Keep the original
+SASL/TLS/filter settings and set `KAFKA_LEGACY_CLUSTER=default`. Back up the
+database first; see the [full upgrade procedure](../README.md#upgrading-an-existing-single-cluster-installation).
+This keeps migrated thresholds and hysteresis active. The example below is
+for an empty database, not a rename of an existing installation.
+
+```yaml
+    env:
+      - name: KAFKA_CLUSTERS
+        value: "harbor,summit"
+      - name: KAFKA_HARBOR_BROKERS
+        value: "harbor-kafka-0.harbor.svc:9092,harbor-kafka-1.harbor.svc:9092"
+      - name: KAFKA_SUMMIT_BROKERS
+        value: "summit-kafka-0.summit.svc:9092"
+      # Shared defaults for both clusters.
+      - name: KAFKA_SASL_MECHANISM
+        value: scram-sha-512
+      - name: KAFKA_SASL_USERNAME
+        value: kafka-usage
+      - name: KAFKA_SASL_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: kafka-phoenix-ext
+            key: sasl-password
+      # Per-cluster override: one Secret key per cluster when the principals
+      # differ. Keys are `sasl-password-<cluster>` by convention.
+      - name: KAFKA_SUMMIT_SASL_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: kafka-phoenix-ext
+            key: sasl-password-summit
+```
+
+Notes for the chart:
+
+- Keep `readinessPath: /health/live`. It is process liveness, not any one
+  cluster's health.
+- Point Phoenix monitors at the cluster they are about:
+  `{base}/health/c/harbor/ready`, `{base}/health/c/harbor/thresholds`, ... The
+  unprefixed `{base}/health/ready` stays bound to `KAFKA_LEGACY_CLUSTER`
+  (`default` when configured, otherwise the first declared cluster).
+  `KAFKA_LEGACY_CLUSTER` does not rename stored data; existing installations
+  must retain `default` as described above. Startup refuses to silently leave
+  populated `default` state or thresholds unconfigured.
+- `{base}/health/clusters` fails while any configured cluster cannot be
+  polled — one monitor for "the extension can see everything".
+- The cluster switcher and the overview page are same-origin links, so the
+  existing `BASE_PATH` Ingress rule and the UI session cookie cover them; no
+  extra Ingress path is needed.
+- `deploy/manifests/networkpolicy-chart.yaml` allows Kafka ports 9092/9094.
+  Brokers in a **different** cluster/network need their own egress CIDR rule;
+  the shipped policy does not know your second Kafka subnet.
+- Per-cluster thresholds are separate rows. Setting `orders` on `harbor` never
+  affects `orders` on `summit`.
